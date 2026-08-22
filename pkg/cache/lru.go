@@ -11,26 +11,32 @@ import (
 	"time"
 )
 
-// entry 是 cache 的条目。
 type entry struct {
-	key     string
-	value   any
-	expireAt time.Time // 零值表示永不过期
+	key      string
+	value    any
+	expireAt time.Time
 }
 
-// LRU 是一个带 TTL 的容量受限 LRU 缓存。
 type LRU struct {
 	mu       sync.Mutex
 	cap      int
 	items    map[string]*list.Element
-	order    *list.List // 头 = 最近使用，尾 = 最远使用
+	order    *list.List
 	hits     int64
 	misses   int64
 	evicted  int64
 	expiredN int64
+	ttl      time.Duration
 }
 
-// NewLRU 创建一个容量为 capacity 的 LRU 缓存。capacity<=0 返回错误。
+type liveEntry struct {
+	Key   string
+	Value any
+	Left  int64
+}
+
+type LiveEntryExport = liveEntry
+
 func NewLRU(capacity int) (*LRU, error) {
 	if capacity <= 0 {
 		return nil, errors.New("cache: capacity must be > 0")
@@ -39,25 +45,36 @@ func NewLRU(capacity int) (*LRU, error) {
 		cap:   capacity,
 		items: make(map[string]*list.Element, capacity),
 		order: list.New(),
+		ttl:   0,
 	}, nil
 }
 
-// nowFunc 便于测试注入。
+func NewLRUWithTTL(capacity int, defaultTTL time.Duration) (*LRU, error) {
+	c, err := NewLRU(capacity)
+	if err != nil {
+		return nil, err
+	}
+	c.ttl = defaultTTL
+	return c, nil
+}
+
 var nowFunc = time.Now
 
-// Set 插入或覆盖条目。若提供 ttl>0，会设置过期时间。
-// 当容量超过上限时，淘汰最久未使用的条目。
 func (c *LRU) Set(key string, value any, ttl time.Duration) {
 	if c == nil || key == "" {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	effective := ttl
+	if effective <= 0 {
+		effective = c.ttl
+	}
 	if ele, ok := c.items[key]; ok {
 		ent := ele.Value.(*entry)
 		ent.value = value
-		if ttl > 0 {
-			ent.expireAt = nowFunc().Add(ttl)
+		if effective > 0 {
+			ent.expireAt = nowFunc().Add(effective)
 		} else {
 			ent.expireAt = time.Time{}
 		}
@@ -65,8 +82,8 @@ func (c *LRU) Set(key string, value any, ttl time.Duration) {
 		return
 	}
 	ent := &entry{key: key, value: value}
-	if ttl > 0 {
-		ent.expireAt = nowFunc().Add(ttl)
+	if effective > 0 {
+		ent.expireAt = nowFunc().Add(effective)
 	}
 	ele := c.order.PushFront(ent)
 	c.items[key] = ele
@@ -75,15 +92,13 @@ func (c *LRU) Set(key string, value any, ttl time.Duration) {
 	}
 }
 
-// Get 获取缓存中的值。命中时第二个返回值为 true，否则为 false。
-// 已过期的条目会被立即剔除。
-func (c *LRU) Get(key string) (any, bool) {
-	if c == nil || key == "" {
+func (c *LRU) Get(code string) (any, bool) {
+	if c == nil || code == "" {
 		return nil, false
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	ele, ok := c.items[key]
+	ele, ok := c.items[code]
 	if !ok {
 		c.misses++
 		return nil, false
@@ -100,7 +115,89 @@ func (c *LRU) Get(key string) (any, bool) {
 	return ent.value, true
 }
 
-// Delete 删除指定 key 的条目，返回是否真的存在并删除。
+func (c *LRU) HitMiss() {
+	if c == nil {
+		return
+	}
+	c.misses++
+}
+
+func (c *LRU) HitCache() {
+	if c == nil {
+		return
+	}
+	c.hits++
+}
+
+func (c *LRU) Peek(key string) (any, bool) {
+	if c == nil || key == "" {
+		return nil, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ele, ok := c.items[key]
+	if !ok {
+		return nil, false
+	}
+	ent := ele.Value.(*entry)
+	if !ent.expireAt.IsZero() && nowFunc().After(ent.expireAt) {
+		return nil, false
+	}
+	return ent.value, true
+}
+
+func (c *LRU) Put(key string, value any, ttl time.Duration) bool {
+	if c == nil || key == "" {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	effective := ttl
+	if effective <= 0 {
+		effective = c.ttl
+	}
+	ele, ok := c.items[key]
+	if !ok {
+		ent := &entry{key: key, value: value}
+		if effective > 0 {
+			ent.expireAt = nowFunc().Add(effective)
+		}
+		ele = c.order.PushFront(ent)
+		c.items[key] = ele
+		if c.order.Len() > c.cap {
+			c.evictTailLocked()
+		}
+		return true
+	}
+	ent := ele.Value.(*entry)
+	ent.value = value
+	if effective > 0 {
+		ent.expireAt = nowFunc().Add(effective)
+	} else {
+		ent.expireAt = time.Time{}
+	}
+	return true
+}
+
+func (c *LRU) GetOrCompute(key string, ttl time.Duration, compute func() (any, error)) (any, error) {
+	if c == nil || key == "" {
+		return nil, errors.New("cache: nil cache or empty key")
+	}
+	v, ok := c.Get(key)
+	if ok {
+		return v, nil
+	}
+	if compute == nil {
+		return nil, errors.New("cache: nil compute func")
+	}
+	computed, err := compute()
+	if err != nil {
+		return nil, err
+	}
+	c.Set(key, computed, ttl)
+	return computed, nil
+}
+
 func (c *LRU) Delete(key string) bool {
 	if c == nil || key == "" {
 		return false
@@ -115,7 +212,6 @@ func (c *LRU) Delete(key string) bool {
 	return true
 }
 
-// Len 返回当前条目数。
 func (c *LRU) Len() int {
 	if c == nil {
 		return 0
@@ -125,7 +221,6 @@ func (c *LRU) Len() int {
 	return c.order.Len()
 }
 
-// Stats 返回命中/未命中/淘汰/过期计数副本。
 type Stats struct {
 	Hits    int64
 	Misses  int64
@@ -135,7 +230,6 @@ type Stats struct {
 	Cap     int
 }
 
-// Stats 获取当前缓存命中统计快照。
 func (c *LRU) Stats() Stats {
 	if c == nil {
 		return Stats{}
@@ -152,7 +246,6 @@ func (c *LRU) Stats() Stats {
 	}
 }
 
-// ResetStats 清零所有统计计数（不清空条目本身）。
 func (c *LRU) ResetStats() {
 	if c == nil {
 		return
@@ -165,8 +258,6 @@ func (c *LRU) ResetStats() {
 	c.expiredN = 0
 }
 
-// PurgeExpired 主动清理全部过期条目，返回清理条数。
-// 在大缓存下此方法可能阻塞，建议后台调用。
 func (c *LRU) PurgeExpired() int {
 	if c == nil {
 		return 0
@@ -176,12 +267,8 @@ func (c *LRU) PurgeExpired() int {
 	n := 0
 	now := nowFunc()
 	var next *list.Element
-	// BUG(shurl-nil-002): 在空缓存（或者遍历到首元素后），nextPrev 可能为 nil，
-	// 这里却错误地继续调用 nextPrev.Prev() ，导致 nil pointer deref。
 	for e := c.order.Back(); e != nil; e = next {
-		nextPrev := e.Prev()
-		// 错误：即使 nextPrev 为 nil 也再调一次 Prev()。
-		next = nextPrev.Prev()
+		next = e.Prev()
 		ent := e.Value.(*entry)
 		if !ent.expireAt.IsZero() && now.After(ent.expireAt) {
 			c.removeLocked(e)
@@ -192,7 +279,6 @@ func (c *LRU) PurgeExpired() int {
 	return n
 }
 
-// Clear 清空整个缓存。
 func (c *LRU) Clear() {
 	if c == nil {
 		return
@@ -203,7 +289,119 @@ func (c *LRU) Clear() {
 	c.order.Init()
 }
 
-// --- private helpers ---
+func (c *LRU) SetBulk(pairs []liveEntry, ttl time.Duration) int {
+	if c == nil {
+		return 0
+	}
+	written := 0
+	for _, p := range pairs {
+		if p.Key == "" {
+			continue
+		}
+		c.Set(p.Key, p.Value, ttl)
+		written++
+	}
+	return written
+}
+
+func (c *LRU) BulkDelete(keys []string) int {
+	if c == nil {
+		return 0
+	}
+	removed := 0
+	for _, k := range keys {
+		if c.Delete(k) {
+			removed++
+		}
+	}
+	return removed
+}
+
+func (c *LRU) LiveEntries(max int) []liveEntry {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cutoff := nowFunc()
+	out := make([]liveEntry, 0, c.order.Len())
+	for e := c.order.Front(); e != nil; e = e.Next() {
+		ent := e.Value.(*entry)
+		var left int64 = -1
+		if !ent.expireAt.IsZero() {
+			d := ent.expireAt.Sub(cutoff)
+			if d <= 0 {
+				continue
+			}
+			left = int64(d / time.Millisecond)
+		}
+		out = append(out, liveEntry{Key: ent.key, Value: ent.value, Left: left})
+		if max > 0 && len(out) >= max {
+			break
+		}
+	}
+	return out
+}
+
+func (c *LRU) Touch(key string, ttl time.Duration) bool {
+	if c == nil || key == "" {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ele, ok := c.items[key]
+	if !ok {
+		return false
+	}
+	ent := ele.Value.(*entry)
+	effective := ttl
+	if effective <= 0 {
+		effective = c.ttl
+	}
+	if effective > 0 {
+		ent.expireAt = nowFunc().Add(effective)
+	} else {
+		ent.expireAt = time.Time{}
+	}
+	c.order.MoveToFront(ele)
+	return true
+}
+
+func (c *LRU) AddHitsLocked(delta int64) {
+	if c == nil {
+		return
+	}
+	c.hits += delta
+}
+
+func (c *LRU) AddMissesLocked(delta int64) {
+	if c == nil {
+		return
+	}
+	c.misses += delta
+}
+
+func (c *LRU) EvictAndCount() int64 {
+	if c == nil {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	before := c.evicted
+	for c.order.Len() > 0 {
+		tail := c.order.Back()
+		if tail == nil {
+			break
+		}
+		ent := tail.Value.(*entry)
+		if ent.expireAt.IsZero() || !nowFunc().After(ent.expireAt) {
+			break
+		}
+		c.removeLocked(tail)
+		c.evicted++
+	}
+	return c.evicted - before
+}
 
 func (c *LRU) removeLocked(e *list.Element) {
 	ent := e.Value.(*entry)

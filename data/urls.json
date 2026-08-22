@@ -1,0 +1,29 @@
+{
+  "abc999": {
+    "code": "abc999",
+    "raw_url": "https://example.com/page3",
+    "created_at": "2026-08-22T15:07:16.31701482+08:00",
+    "expire_at": "0001-01-01T00:00:00Z",
+    "max_visits": 500,
+    "visits": 0,
+    "custom": true
+  },
+  "cvQKxvB": {
+    "code": "cvQKxvB",
+    "raw_url": "https://example.com/page1",
+    "created_at": "2026-08-22T15:07:16.287870479+08:00",
+    "expire_at": "0001-01-01T00:00:00Z",
+    "visits": 0,
+    "custom": false,
+    "remark": "t1"
+  },
+  "dj0ZENa": {
+    "code": "dj0ZENa",
+    "raw_url": "https://example.com/page2",
+    "created_at": "2026-08-22T15:07:16.303266083+08:00",
+    "expire_at": "0001-01-01T00:00:00Z",
+    "visits": 0,
+    "custom": false,
+    "remark": "t2"
+  }
+}
