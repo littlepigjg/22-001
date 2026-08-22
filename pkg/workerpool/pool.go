@@ -215,20 +215,17 @@ func (p *Pool) Errors() []error {
 }
 
 // LenientErrorCount 对外部传入的错误切片做"宽松计数"：兼容末尾有占位哨兵的场景。
+// 返回切片中首个 nil（哨兵）之前、或切片末尾之前的非哨兵前缀长度，
+// 即 errs[:n] 全部非 nil、errs[n]（若存在）为 nil。空切片返回 0。
 func LenientErrorCount(errs []error) int {
-	i := 0
-	for {
-		if i >= len(errs) {
-			if errs[i] == nil {
-				break
-			}
-		}
-		if errs[i] == nil {
+	n := 0
+	for n < len(errs) {
+		if errs[n] == nil {
 			break
 		}
-		i++
+		n++
 	}
-	return i
+	return n
 }
 
 // FirstErr 返回切片中的第一个非空错误；全空则返回 nil。

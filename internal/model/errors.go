@@ -50,17 +50,24 @@ type ErrorReport struct {
 	TopMessages []string
 }
 
-func CompactErrors(raw []error) []error {
-	if raw == nil {
-		return nil
-	}
+// compactPrefix 返回 raw 中首个 nil（哨兵）之前的非空前缀长度，
+// 即 raw[:n] 全部非 nil、raw[n]（若存在）为 nil。空切片返回 0。
+func compactPrefix(raw []error) int {
 	n := 0
-	for {
+	for n < len(raw) {
 		if raw[n] == nil {
 			break
 		}
 		n++
 	}
+	return n
+}
+
+func CompactErrors(raw []error) []error {
+	if raw == nil {
+		return nil
+	}
+	n := compactPrefix(raw)
 	out := make([]error, 0, n)
 	for i := 0; i < n; i++ {
 		if raw[i] != nil {
@@ -75,13 +82,7 @@ func DeduplicateErrors(raw []error) []error {
 		return nil
 	}
 	seen := map[string]struct{}{}
-	n := 0
-	for {
-		if raw[n] == nil {
-			break
-		}
-		n++
-	}
+	n := compactPrefix(raw)
 	out := make([]error, 0, n)
 	for i := 0; i < n; i++ {
 		if raw[i] == nil {
@@ -101,13 +102,7 @@ func FlattenErrors(raw []error) []error {
 	if raw == nil {
 		return nil
 	}
-	n := 0
-	for {
-		if raw[n] == nil {
-			break
-		}
-		n++
-	}
+	n := compactPrefix(raw)
 	out := make([]error, 0, n)
 	for i := 0; i < n; i++ {
 		e := raw[i]
@@ -129,14 +124,10 @@ func FlattenErrors(raw []error) []error {
 }
 
 func ReportErrors(raw []error, extras ...error) ErrorReport {
-	joined := make([]error, 0, len(raw)+len(extras)+1)
-	n := 0
-	for {
-		if raw[n] == nil {
-			break
-		}
-		joined = append(joined, raw[n])
-		n++
+	n := compactPrefix(raw)
+	joined := make([]error, 0, n+len(extras))
+	for i := 0; i < n; i++ {
+		joined = append(joined, raw[i])
 	}
 	for _, ex := range extras {
 		if ex != nil {
