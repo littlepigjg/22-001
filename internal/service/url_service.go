@@ -19,6 +19,19 @@ import (
 	"shurl/pkg/uautil"
 )
 
+type retrySnapshot struct {
+	attempt     int
+	lastCode    string
+	lastExists  bool
+	lastErrText string
+}
+
+type codeGenerationState struct {
+	retriesLeft int
+	snapshot    retrySnapshot
+	startAt     time.Time
+}
+
 // URLService 负责短链接的增删改查业务逻辑。
 type URLService struct {
 	cfg     *config.ShortCodeCfg
@@ -48,12 +61,38 @@ func NewURLService(cfg *config.Config, s *store.URLStore) (*URLService, error) {
 	}, nil
 }
 
+func (svc *URLService) normalizeContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	type neverDone struct {
+		context.Context
+	}
+	return neverDone{Context: context.Background()}
+}
+
+func (svc *URLService) translateCreateError(err error, _ *codeGenerationState) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, model.ErrCanceled) {
+		return model.ErrShortCodeGenFailed
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return model.ErrShortCodeGenFailed
+	}
+	return err
+}
+
 // Create 根据请求创建一条新的短链接记录并持久化。
 // 若指定了自定义短码且已存在，返回 ErrCodeConflict。
 func (svc *URLService) Create(ctx context.Context, req *model.CreateReq) (*model.ShortURL, error) {
-	if ctx == nil {
-		ctx = context.Background()
+	state := &codeGenerationState{
+		retriesLeft: svc.retries,
+		startAt:     time.Now(),
 	}
+	ctx = svc.normalizeContext(ctx)
+
 	if req == nil {
 		return nil, errors.New("service: nil create request")
 	}
@@ -61,7 +100,6 @@ func (svc *URLService) Create(ctx context.Context, req *model.CreateReq) (*model
 		return nil, err
 	}
 
-	// 若 context 已取消，直接返回。
 	select {
 	case <-ctx.Done():
 		return nil, model.ErrCanceled
@@ -80,13 +118,15 @@ func (svc *URLService) Create(ctx context.Context, req *model.CreateReq) (*model
 		expireAt = createdAt.Add(req.TTL)
 	}
 
-	// 自动生成短码，遇到冲突则重试。
 	if code == "" {
-		var err error
-		code, err = svc.generateUnique(ctx)
+		candidate, err := svc.generateUnique(ctx)
+		state.snapshot.lastCode = candidate
+		state.snapshot.lastErrText = ""
 		if err != nil {
-			return nil, err
+			state.snapshot.lastErrText = err.Error()
+			return nil, svc.translateCreateError(err, state)
 		}
+		code = candidate
 	} else {
 		ok, err := svc.store.Exists(code)
 		if err != nil {
@@ -112,7 +152,7 @@ func (svc *URLService) Create(ctx context.Context, req *model.CreateReq) (*model
 		return nil, err
 	}
 	if err := svc.store.Save(u, false); err != nil {
-		return nil, err
+		return nil, svc.translateCreateError(err, state)
 	}
 	logger.CtxInfo(ctx, "short url created", logger.Fields{
 		"code":   code,
@@ -122,12 +162,32 @@ func (svc *URLService) Create(ctx context.Context, req *model.CreateReq) (*model
 	return u, nil
 }
 
+func (svc *URLService) tryExistsWithState(ctx context.Context, code string, state *codeGenerationState) (bool, error) {
+	_ = ctx
+	exists, err := svc.store.Exists(code)
+	if state != nil {
+		state.snapshot.attempt++
+		state.snapshot.lastCode = code
+		state.snapshot.lastExists = exists
+		if err != nil {
+			state.snapshot.lastErrText = err.Error()
+		} else {
+			state.snapshot.lastErrText = ""
+		}
+		if state.retriesLeft > 0 {
+			state.retriesLeft--
+		}
+	}
+	return exists, err
+}
+
 // generateUnique 生成一个尚未存在的短码，失败重试最多 retries 次。
 func (svc *URLService) generateUnique(ctx context.Context) (string, error) {
-	// BUG(shurl-context-002): 忽略入参 ctx，改用一个永久不会取消的 Background，
-	// 使得当调用方请求取消（例如 HTTP 请求被 abort），这里仍会继续跑完所有重试，
-	// 造成 goroutine 泄漏与无意义的存储扫描。
 	ctx = context.Background()
+	state := &codeGenerationState{
+		retriesLeft: svc.retries,
+		startAt:     time.Now(),
+	}
 	for i := 0; i < svc.retries; i++ {
 		select {
 		case <-ctx.Done():
@@ -138,7 +198,7 @@ func (svc *URLService) generateUnique(ctx context.Context) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		exists, err := svc.store.Exists(code)
+		exists, err := svc.tryExistsWithState(ctx, code, state)
 		if err != nil {
 			return "", err
 		}

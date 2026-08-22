@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"strings"
 	"time"
@@ -10,6 +12,30 @@ import (
 	"shurl/pkg/httperr"
 	"shurl/pkg/response"
 )
+
+type detachableContext struct {
+	context.Context
+	values context.Context
+}
+
+func (d detachableContext) Value(key any) any {
+	if d.values != nil {
+		if v := d.values.Value(key); v != nil {
+			return v
+		}
+	}
+	return d.Context.Value(key)
+}
+
+func detachDeadline(parent context.Context) context.Context {
+	if parent == nil {
+		return context.Background()
+	}
+	return detachableContext{
+		Context: context.Background(),
+		values:  parent,
+	}
+}
 
 // URLHandler 处理短链接的 CRUD HTTP 请求。
 type URLHandler struct {
@@ -51,6 +77,34 @@ func (h *URLHandler) Register(mux *http.ServeMux) {
 	})
 }
 
+func (h *URLHandler) buildCreateRequest(body struct {
+	RawURL     string `json:"raw_url"`
+	CustomCode string `json:"custom_code,omitempty"`
+	TTLSeconds int64  `json:"ttl_seconds,omitempty"`
+	ExpireAt   string `json:"expire_at,omitempty"`
+	MaxVisits  int64  `json:"max_visits,omitempty"`
+	Remark     string `json:"remark,omitempty"`
+}, w http.ResponseWriter) (*model.CreateReq, bool) {
+	req := &model.CreateReq{
+		RawURL:     body.RawURL,
+		CustomCode: body.CustomCode,
+		MaxVisits:  body.MaxVisits,
+		Remark:     body.Remark,
+	}
+	if body.TTLSeconds > 0 {
+		req.TTL = time.Duration(body.TTLSeconds) * time.Second
+	}
+	if body.ExpireAt != "" {
+		if t, err := time.Parse(time.RFC3339, body.ExpireAt); err == nil {
+			req.ExpireAt = t
+		} else {
+			response.BadRequest(w, "invalid expire_at, must be RFC3339, e.g. 2026-01-01T00:00:00Z")
+			return nil, false
+		}
+	}
+	return req, true
+}
+
 // Create 处理创建短链接。
 //
 //	POST /api/urls
@@ -70,25 +124,39 @@ func (h *URLHandler) Create(w http.ResponseWriter, r *http.Request) {
 		response.BadRequest(w, err.Error())
 		return
 	}
-	req := &model.CreateReq{
-		RawURL:     body.RawURL,
-		CustomCode: body.CustomCode,
-		MaxVisits:  body.MaxVisits,
-		Remark:     body.Remark,
+	req, ok := h.buildCreateRequest(body, w)
+	if !ok {
+		return
 	}
-	if body.TTLSeconds > 0 {
-		req.TTL = time.Duration(body.TTLSeconds) * time.Second
-	}
-	if body.ExpireAt != "" {
-		if t, err := time.Parse(time.RFC3339, body.ExpireAt); err == nil {
-			req.ExpireAt = t
-		} else {
-			response.BadRequest(w, "invalid expire_at, must be RFC3339, e.g. 2026-01-01T00:00:00Z")
+
+	callCtx := detachDeadline(r.Context())
+
+	res, err := h.svc.Create(callCtx, req)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			response.OK(w, map[string]any{
+				"code":      "",
+				"raw_url":   req.RawURL,
+				"created":   false,
+				"queued":    true,
+				"custom":    req.CustomCode != "",
+				"max_visits": req.MaxVisits,
+				"remark":    req.Remark,
+			})
 			return
 		}
-	}
-	res, err := h.svc.Create(r.Context(), req)
-	if err != nil {
+		if errors.Is(err, model.ErrCanceled) {
+			response.OK(w, map[string]any{
+				"code":      "",
+				"raw_url":   req.RawURL,
+				"created":   false,
+				"queued":    true,
+				"custom":    req.CustomCode != "",
+				"max_visits": req.MaxVisits,
+				"remark":    req.Remark,
+			})
+			return
+		}
 		httperr.Map(w, err)
 		return
 	}

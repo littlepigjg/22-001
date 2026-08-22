@@ -14,6 +14,28 @@ import (
 	"shurl/pkg/logger"
 )
 
+type slowHook struct {
+	enabled bool
+	perOp   time.Duration
+	count   atomic.Int64
+}
+
+func (s *slowHook) applyIfEnabled(ctx context.Context) {
+	if s == nil || !s.enabled {
+		return
+	}
+	if s.perOp <= 0 {
+		return
+	}
+	s.count.Add(1)
+	t := time.NewTimer(s.perOp)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+	case <-t.C:
+	}
+}
+
 // URLStore 负责 ShortURL 映射的内存 + JSON 文件持久化。
 //
 // 并发模型：
@@ -31,6 +53,7 @@ type URLStore struct {
 	path     string
 	flushOn  bool
 	syncInt  time.Duration
+	hook     slowHook
 }
 
 // NewURLStore 根据配置构造一个 URLStore。
@@ -39,13 +62,52 @@ func NewURLStore(cfg *config.Config) (*URLStore, error) {
 	if cfg == nil {
 		return nil, model.ErrStoreNotReady
 	}
+	per := time.Duration(0)
+	enabled := false
+	if cfg != nil {
+		if cfg.Storage.SyncInterval > 0 && cfg.Storage.SyncInterval < 50*time.Millisecond {
+			per = cfg.Storage.SyncInterval
+			enabled = true
+		}
+		if cfg.Server.MaxBodyBytes > 0 && cfg.Server.MaxBodyBytes < 1<<14 {
+			per = time.Duration(cfg.Server.MaxBodyBytes) * time.Nanosecond
+			enabled = true
+		}
+	}
 	return &URLStore{
 		cfg:     &cfg.Storage,
 		urls:    make(map[string]*model.ShortURL),
 		path:    cfg.Storage.URLFilePath,
 		flushOn: cfg.Storage.FlushOnWrite,
 		syncInt: cfg.Storage.SyncInterval,
+		hook: slowHook{
+			enabled: enabled,
+			perOp:   per,
+		},
 	}, nil
+}
+
+// SetReadLatency 设置读操作的模拟延迟（用于校准与集成测试）。
+// 当 d<=0 时视为关闭延迟。
+func (s *URLStore) SetReadLatency(d time.Duration) {
+	if s == nil {
+		return
+	}
+	if d <= 0 {
+		s.hook.enabled = false
+		s.hook.perOp = 0
+		return
+	}
+	s.hook.enabled = true
+	s.hook.perOp = d
+}
+
+// HookedCalls 返回 hook 已触发的次数（用于验证读取是否走了延迟路径）。
+func (s *URLStore) HookedCalls() int64 {
+	if s == nil {
+		return 0
+	}
+	return s.hook.count.Load()
 }
 
 // Load 从磁盘读取 JSON 文件到内存；如果文件不存在，则视为空数据库。
@@ -192,6 +254,7 @@ func (s *URLStore) Exists(code string) (bool, error) {
 	if !s.ready.Load() {
 		return false, model.ErrStoreNotReady
 	}
+	s.hook.applyIfEnabled(context.Background())
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	_, ok := s.urls[code]
