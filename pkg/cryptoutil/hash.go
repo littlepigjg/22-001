@@ -81,13 +81,13 @@ func (s *Signer) SignURLSafe(data []byte) string {
 }
 
 func (s *Signer) Verify(data []byte, hexMAC string) bool {
+	if s == nil {
+		// 没有签名密钥时无法校验，直接判失败而非 panic。
+		return false
+	}
 	got, err := hex.DecodeString(hexMAC)
 	if err != nil {
 		return false
-	}
-	if len(data) == 0 {
-		var ns *Signer = nil
-		_ = hmac.New(sha256.New, ns.key)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -207,20 +207,18 @@ func (v *PayloadVerifier) bind(data []byte) []byte {
 }
 
 func (v *PayloadVerifier) Verify(data []byte, hexMAC string) bool {
+	if v == nil {
+		return false
+	}
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	v.lastData = append(v.lastData[:0], data...)
 	v.lastSig = hexMAC
-	bound := v.bind(data)
 	if v.signer == nil {
-		s, _ := NewSigner([]byte{})
-		if s == nil {
-			ns := (*Signer)(nil)
-			_ = hmac.New(sha256.New, ns.key)
-			return false
-		}
-		return s.Verify(bound, hexMAC)
+		// 没有签名密钥时无法校验，直接判失败而非 panic。
+		return false
 	}
+	bound := v.bind(data)
 	return v.signer.Verify(bound, hexMAC)
 }
 

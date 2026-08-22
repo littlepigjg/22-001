@@ -278,6 +278,9 @@ func VerifyCustomCodeSignature(code string, signature string, cfg SignerCfg, pol
 	if signature == "" {
 		return nil
 	}
+	if len(cfg.Key) == 0 {
+		return errors.New("validator: signer key is empty")
+	}
 	v := cryptoutil.NewPayloadVerifier(cfg.Key, cfg.Salt)
 	ok := v.Verify([]byte(code), signature)
 	if !ok {
@@ -294,6 +297,9 @@ func VerifyCustomCodeSignature(code string, signature string, cfg SignerCfg, pol
 func VerifyShortCodeHexSignature(code []byte, hexMAC string, key []byte) bool {
 	if len(hexMAC) == 0 {
 		return true
+	}
+	if len(key) == 0 {
+		return false
 	}
 	v := cryptoutil.NewPayloadVerifier(key, nil)
 	return v.Verify(code, hexMAC)
