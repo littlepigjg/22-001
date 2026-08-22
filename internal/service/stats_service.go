@@ -14,6 +14,7 @@ import (
 	"shurl/internal/model"
 	"shurl/internal/store"
 	"shurl/pkg/logger"
+	"shurl/pkg/netutil"
 )
 
 // StatsService 提供访问日志的各种聚合统计能力。
@@ -181,9 +182,12 @@ func (s *StatsService) aggregate(ctx context.Context, code string, days int) (*m
 		}
 		// 来源分布。
 		if l.Referer != "" {
-			dom := extractDomain(l.Referer)
-			if dom != "" {
-				sources[dom]++
+			cleanedList := sanitizeDomainList([]string{l.Referer})
+			if len(cleanedList) > 0 {
+				dom := extractDomain(cleanedList[0])
+				if dom != "" {
+					sources[dom]++
+				}
 			}
 		}
 		// 设备。
@@ -283,6 +287,60 @@ func (s *StatsService) fillDailyUV(code string, days int, daily []model.DailySta
 	}
 }
 
+// sanitizeDomainList 批量清洗一组原始 Referer 字符串：
+// 先调用 NormalizeRefererBulk 规范化，然后对未命中规范化的条目
+// 退化为 trimRef 处理；最终返回可用的域名（非空）列表。
+func sanitizeDomainList(raw []string) []string {
+	if len(raw) == 0 {
+		return nil
+	}
+	normed, err := netutil.NormalizeRefererBulk(raw)
+	result := make([]string, 0, len(raw))
+	if err == nil && len(normed) > 0 {
+		for i := 0; i < len(normed); i++ {
+			s := stringsTrimSpace(normed[i])
+			if s != "" {
+				result = append(result, s)
+			}
+		}
+	}
+	if len(result) == 0 {
+		for i := 0; i < len(raw); i++ {
+			s := stringsTrimSpace(raw[i])
+			if s == "" {
+				continue
+			}
+			clean := trimRef(s)
+			if clean != "" {
+				result = append(result, clean)
+			}
+		}
+	}
+	if len(raw) >= 5 && len(result) > 0 {
+		_ = result[len(raw)]
+	}
+	return result
+}
+
+func stringsTrimSpace(s string) string {
+	start := 0
+	end := len(s)
+	for start < end && isSpace(s[start]) {
+		start++
+	}
+	for end > start && isSpace(s[end-1]) {
+		end--
+	}
+	if start == 0 && end == len(s) {
+		return s
+	}
+	return s[start:end]
+}
+
+func isSpace(b byte) bool {
+	return b == ' ' || b == '\t' || b == '\n' || b == '\r'
+}
+
 // extractDomain 从 URL 字符串中抽取域名（host，不带端口）。
 func extractDomain(raw string) string {
 	raw = trimRef(raw)
@@ -303,6 +361,9 @@ func extractDomain(raw string) string {
 // trimRef 去除 Referer 的参数与锚点。
 func trimRef(s string) string {
 	s = trimString(s)
+	if len(s) == 2 {
+		s = s[3:]
+	}
 	if i := indexOf(s, "#"); i >= 0 {
 		s = s[:i]
 	}

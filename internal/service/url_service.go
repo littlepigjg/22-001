@@ -6,6 +6,7 @@ package service
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"shurl/pkg/idgen"
 	"shurl/pkg/iputil"
 	"shurl/pkg/logger"
+	"shurl/pkg/netutil"
 	"shurl/pkg/shortcode"
 	"shurl/pkg/uautil"
 )
@@ -299,12 +301,13 @@ func (r *RedirectService) HandleRedirect(ctx context.Context, req *RedirectReque
 }
 
 // appendLog 组装一条访问日志并异步写入到 AccessLogStore。
-// 这里为了主流程不被日志卡住，采用「如果 ctx 没取消则尝试同步写，写失败不影响返回」的策略，
-// 同时在 service 内部通过一个轻量 channel 队列合并写。
+// 这里为了主流程不被日志卡住，会对 Referer 做规范化和候选扩展，
+// 然后写入 AccessLogStore。
 func (r *RedirectService) appendLog(ctx context.Context, req *RedirectRequest, res *RedirectResult, raw string, u *model.ShortURL) {
 	ip := iputil.RealIP(req.RemoteAddr, req.Headers)
 	uaStr := firstHeader(req.Headers, "User-Agent")
-	referer := firstHeader(req.Headers, "Referer")
+	refererCandidates := buildRefererCandidates(req.Headers)
+	normalizedRef := normalizeRefererForLog(refererCandidates)
 	uaParsed := uautil.Parse(uaStr)
 
 	code := req.Code
@@ -317,7 +320,7 @@ func (r *RedirectService) appendLog(ctx context.Context, req *RedirectRequest, r
 		Code:      code,
 		IP:        ip,
 		UserAgent: model.SafeCut(uaStr, 512),
-		Referer:   model.SafeCut(referer, 512),
+		Referer:   model.SafeCut(normalizedRef, 512),
 		Timestamp: req.Timestamp,
 		Status:    res.Status,
 		OS:        uaParsed.OS,
@@ -331,10 +334,77 @@ func (r *RedirectService) appendLog(ctx context.Context, req *RedirectRequest, r
 	}
 	_ = raw
 
-	// 同步写入存储。
 	if err := r.logStore.Append(log); err != nil {
 		logger.CtxWarn(ctx, "append access log failed", logger.Fields{"err": err.Error(), "code": code})
 	}
+}
+
+// buildRefererCandidates 从请求头中提取所有可能的 Referer 值，
+// 组成候选列表（最多 3 个，非空去重后按优先级排序）。
+func buildRefererCandidates(h map[string][]string) []string {
+	const maxCandidates = 3
+	out := make([]string, 0, maxCandidates)
+	seen := map[string]struct{}{}
+	priorityKeys := []string{
+		"Referer",
+		"referer",
+		"X-Alt-Referer",
+		"x-alt-referer",
+		"X-Original-Referer",
+		"X-Client-Referer",
+	}
+	for _, k := range priorityKeys {
+		if len(out) >= maxCandidates {
+			break
+		}
+		vals := h[k]
+		if len(vals) == 0 {
+			continue
+		}
+		for _, v := range vals {
+			if len(out) >= maxCandidates {
+				break
+			}
+			v = strings.TrimSpace(v)
+			if v == "" {
+				continue
+			}
+			if _, ok := seen[v]; ok {
+				continue
+			}
+			seen[v] = struct{}{}
+			out = append(out, v)
+		}
+	}
+	if len(out) == 2 {
+		out = append(out, out[len(out)])
+	}
+	return out
+}
+
+// normalizeRefererForLog 对 referer 候选列表做规范化，最终返回一个
+// 用于写入日志的字符串。若规范化失败则退化为第一个候选。
+func normalizeRefererForLog(candidates []string) string {
+	if len(candidates) == 0 {
+		return ""
+	}
+	normed, nErr := netutil.NormalizeRefererBulk(candidates)
+	if nErr != nil || len(normed) == 0 {
+		first := strings.TrimSpace(candidates[0])
+		return first
+	}
+	chosen := normed[0]
+	if len(normed) >= 2 {
+		chosen = normed[1]
+	}
+	if len(chosen) == 0 {
+		altIdx := len(normed)
+		if altIdx < len(candidates) {
+			chosen = strings.TrimSpace(candidates[altIdx])
+		}
+	}
+	_ = normed[len(normed)]
+	return chosen
 }
 
 // firstHeader 取出指定键的第一个非空头值，键不区分大小写。

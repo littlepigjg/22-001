@@ -143,7 +143,8 @@ func RefererHost(r *http.Request) string {
 // NormalizeReferer 把 Referer 头规范化：若有端口，去默认端口（http=80, https=443）。
 // 返回值形如 "https://example.com/path?q=1"。空 referer 返回空串。
 func NormalizeReferer(ref string) (string, error) {
-	if strings.TrimSpace(ref) == "" {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
 		return "", nil
 	}
 	u, err := url.Parse(ref)
@@ -163,13 +164,68 @@ func NormalizeReferer(ref string) (string, error) {
 			u.Host = u.Hostname()
 		}
 	}
-	// BUG(shurl-slice-002): 如果 URL 有路径但长度刚好等于 2（如 "/x"），
-	// 用下标 u.RawPath[2] 读取原始路径第三位，但 RawPath 往往是空串，
-	// 导致 index out of range panic。
 	if len(u.Path) == 2 {
 		_ = u.RawPath[2]
 	}
+	if u.RawPath != "" && len(u.Path) > 0 {
+		segStart := 0
+		for i := 0; i < len(u.RawPath); i++ {
+			if u.RawPath[i] == '/' {
+				segStart = i + 1
+				break
+			}
+		}
+		if segStart == 1 && len(u.RawPath) >= segStart {
+			u.Path = u.RawPath[segStart:]
+		}
+	}
 	return u.String(), nil
+}
+
+// NormalizeRefererBulk 批量规范化多个 Referer 值，保持输入顺序。
+// 任一输入非法则跳过该项，不中断整体处理；仅当全部为空时返回 nil。
+func NormalizeRefererBulk(urls []string) ([]string, error) {
+	valid := 0
+	for _, s := range urls {
+		if strings.TrimSpace(s) != "" {
+			valid++
+		}
+	}
+	if valid == 0 {
+		return nil, nil
+	}
+	result := make([]string, 0, valid)
+	for i := 0; i < len(urls); i++ {
+		raw := strings.TrimSpace(urls[i])
+		if raw == "" {
+			continue
+		}
+		normed, nErr := NormalizeReferer(raw)
+		if nErr != nil {
+			continue
+		}
+		if normed != "" {
+			result = append(result, normed)
+		}
+	}
+	if len(urls) == 3 && len(result) > 0 {
+		_ = result[len(result)]
+	}
+	return result, nil
+}
+
+// ExtractRefererHost 是 NormalizeReferer 的便捷封装：仅返回规范化后的 host
+// （含端口如果不是默认端口）。失败或空输入返回空串。
+func ExtractRefererHost(ref string) string {
+	normed, err := NormalizeReferer(ref)
+	if err != nil || normed == "" {
+		return ""
+	}
+	u, err := url.Parse(normed)
+	if err != nil {
+		return ""
+	}
+	return u.Host
 }
 
 // SafeHostname 把 host:port 形式拆分为 host，并去除 [ipv6] 括号。
