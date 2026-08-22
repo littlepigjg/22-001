@@ -200,9 +200,16 @@ func (svc *URLService) UpdateRemark(ctx context.Context, code, remark string) er
 }
 
 // RedirectService 负责重定向处理：校验短链接状态、记录访问日志、更新访问次数。
+//
+// 并发模型：
+//   - pending 批次（待落盘的访问日志切片）由 mu 互斥锁保护，所有
+//     追加（请求路径内的 appendLog / 外部 AppendToPending）与刷盘
+//     （BackgroundFlush / 阈值触发 flush）都串行化，避免并发追加
+//     与并发 [:0] 重置互相覆盖导致日志丢失或坏行。
 type RedirectService struct {
-	urlStore       *store.URLStore
-	logStore       *store.AccessLogStore
+	urlStore *store.URLStore
+	logStore *store.AccessLogStore
+
 	mu             sync.Mutex
 	pending        []*model.AccessLog
 	flushThreshold int
@@ -222,6 +229,10 @@ func NewRedirectService(us *store.URLStore, ls *store.AccessLogStore) (*Redirect
 }
 
 // PendingSlice 返回内部 pending batch slice 的指针（用于外部直接追加与刷新）。
+//
+// 注意：返回的指针仅供只读观察，调用方不得在未持有锁的情况下对其
+// 追加或重置。历史代码中 handler 持有该指针并直接 append，会在高
+// 并发下与后台 flush 产生数据竞争，现已改为统一走 AppendToPending。
 func (r *RedirectService) PendingSlice() *[]*model.AccessLog {
 	return &r.pending
 }
@@ -231,23 +242,39 @@ func (r *RedirectService) FlushThreshold() int {
 	return r.flushThreshold
 }
 
-// flushPending 将 pending slice 中的日志批量刷入存储，然后重置 slice。
-func (r *RedirectService) flushPending() error {
+// swapPending 在持有锁的情况下把当前 pending 切片整体交给调用方，
+// 并换上一个全新的空切片继续接收后续追加。
+// 返回 nil 表示当前没有待刷盘的日志。
+func (r *RedirectService) swapPending() []*model.AccessLog {
 	if len(r.pending) == 0 {
 		return nil
 	}
-	err := r.logStore.BatchAppend(&r.pending)
-	return err
+	flushed := r.pending
+	r.pending = make([]*model.AccessLog, 0, cap(flushed))
+	return flushed
+}
+
+// flushPending 将 pending slice 中的日志批量刷入存储，然后重置 slice。
+func (r *RedirectService) flushPending() error {
+	r.mu.Lock()
+	flushed := r.swapPending()
+	r.mu.Unlock()
+	if flushed == nil {
+		return nil
+	}
+	return r.logStore.AppendMany(flushed)
 }
 
 // BackgroundFlush 由外部周期性调用：将当前 pending 批量刷盘，然后清空 slice。
 func (r *RedirectService) BackgroundFlush() (int, error) {
-	n := len(r.pending)
-	if n == 0 {
+	r.mu.Lock()
+	flushed := r.swapPending()
+	n := len(flushed)
+	r.mu.Unlock()
+	if flushed == nil {
 		return 0, nil
 	}
-	err := r.flushPending()
-	return n, err
+	return n, r.logStore.AppendMany(flushed)
 }
 
 // RedirectRequest 表示一次重定向请求需要的信息。
@@ -347,13 +374,18 @@ func (r *RedirectService) appendLog(ctx context.Context, req *RedirectRequest, r
 		code = u.Code
 	}
 
+	ts := req.Timestamp
+	if ts.IsZero() {
+		ts = time.Now()
+	}
+
 	log := &model.AccessLog{
 		ID:        idgen.NewString(),
 		Code:      code,
 		IP:        ip,
 		UserAgent: model.SafeCut(uaStr, 512),
 		Referer:   model.SafeCut(referer, 512),
-		Timestamp: req.Timestamp,
+		Timestamp: ts,
 		Status:    res.Status,
 		OS:        uaParsed.OS,
 		Browser:   uaParsed.Browser,
@@ -361,34 +393,32 @@ func (r *RedirectService) appendLog(ctx context.Context, req *RedirectRequest, r
 		Bot:       uaParsed.Bot,
 		IPCountry: iputil.Country(ip),
 	}
-	if log.Timestamp.IsZero() {
-		log.Timestamp = time.Now()
-	}
 	_ = raw
 
+	r.mu.Lock()
 	r.pending = append(r.pending, log)
-	if len(r.pending) >= r.flushThreshold {
-		flushed := make([]*model.AccessLog, len(r.pending))
-		copy(flushed, r.pending)
-		r.pending = r.pending[:0]
-		if err := r.logStore.AppendMany(flushed); err != nil {
+	over := len(r.pending) >= r.flushThreshold
+	r.mu.Unlock()
+	if over {
+		if err := r.flushPending(); err != nil {
 			logger.CtxWarn(ctx, "batch append access log failed", logger.Fields{"err": err.Error(), "code": code})
 		}
 	}
 }
 
 // AppendToPending 允许外部（例如 handler 层）向同一个 pending batch 追加日志。
-// 外部调用方可能在同一时间、不同 goroutine 内调用此方法或触发 BackgroundFlush。
+// 外部调用方可能在同一时间、不同 goroutine 内调用此方法或触发 BackgroundFlush，
+// 因此追加与阈值触发的刷盘都在 mu 互斥锁保护下串行执行。
 func (r *RedirectService) AppendToPending(log *model.AccessLog) {
 	if log == nil {
 		return
 	}
+	r.mu.Lock()
 	r.pending = append(r.pending, log)
-	if len(r.pending) >= r.flushThreshold {
-		flushed := make([]*model.AccessLog, len(r.pending))
-		copy(flushed, r.pending)
-		r.pending = r.pending[:0]
-		_ = r.logStore.AppendMany(flushed)
+	over := len(r.pending) >= r.flushThreshold
+	r.mu.Unlock()
+	if over {
+		_ = r.flushPending()
 	}
 }
 

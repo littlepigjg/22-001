@@ -63,12 +63,12 @@ func (a *AccessLogStore) Open(ctx context.Context) error {
 	a.ready.Store(true)
 
 	if a.syncInt > 0 {
+		// 后台定时 fsync 与调用方（HTTP 请求 / 信号）的 ctx 生命周期无关：
+		// 用 Background 派生，仅由 Close() 通过 cancel 终止，避免请求
+		// 结束 ctx 被取消后定时落盘 goroutine 立刻退出，导致后续 Append
+		// 不能真正落盘。
 		var inner context.Context
-		// BUG(shurl-context-003): 这里错误地使用 ctx 作为父 context（而不是
-		// Background），并且设置了一个错误的、与 ctx 同生命周期的较短超时。
-		// 当 Open 返回后，调用方 ctx 被取消（例如 HTTP 请求结束），后台定时
-		// Sync 的 goroutine 会立即退出，导致后续的 Append 不能被真正落盘。
-		inner, a.cancel = context.WithTimeout(ctx, 5*time.Second)
+		inner, a.cancel = context.WithCancel(context.Background())
 		a.wg.Add(1)
 		go func() {
 			defer a.wg.Done()
@@ -147,6 +147,10 @@ func (a *AccessLogStore) Append(log *model.AccessLog) error {
 	if !a.ready.Load() {
 		return model.ErrStoreNotReady
 	}
+	if err := log.Validate(); err != nil {
+		// 拒绝写入不合法的日志，保证落盘文件干净合法。
+		return model.NewStoreError("ValidateLog", log.Code, err)
+	}
 	data, err := json.Marshal(log)
 	if err != nil {
 		return model.NewStoreError("MarshalLog", log.Code, err)
@@ -167,6 +171,8 @@ func (a *AccessLogStore) Append(log *model.AccessLog) error {
 }
 
 // AppendMany 批量追加访问日志（只加一次锁，减少加锁开销）。
+// 单条日志为 nil 或校验失败时跳过该条并记录告警，不丢弃整批，
+// 避免坏数据导致大批正常日志一起丢失。
 func (a *AccessLogStore) AppendMany(logs []*model.AccessLog) error {
 	if len(logs) == 0 {
 		return nil
@@ -179,9 +185,14 @@ func (a *AccessLogStore) AppendMany(logs []*model.AccessLog) error {
 		if l == nil {
 			continue
 		}
+		if err := l.Validate(); err != nil {
+			logger.Warn("skip invalid access log", logger.Fields{"code": l.Code, "err": err.Error()})
+			continue
+		}
 		data, err := json.Marshal(l)
 		if err != nil {
-			return model.NewStoreError("MarshalLog", l.Code, err)
+			logger.Warn("skip unmarshalable access log", logger.Fields{"code": l.Code, "err": err.Error()})
+			continue
 		}
 		buf = append(buf, data...)
 		buf = append(buf, '\n')
@@ -202,7 +213,9 @@ func (a *AccessLogStore) AppendMany(logs []*model.AccessLog) error {
 
 // BatchAppend 接收外部传入的指向 batch slice 的指针，将其中所有日志写入磁盘，
 // 然后直接把该外部 slice 重置为空（复用底层数组）。
-// 注意：调用方持有该 slice 的 goroutine 可能与其他调用方共享同一个底层数组。
+// 单条日志为 nil 或校验失败时跳过该条，不丢弃整批。
+// 注意：调用方持有该 slice 的 goroutine 可能与其他调用方共享同一个底层数组，
+// 因此调用方需自行保证传入期间不会有并发对该 slice 的追加或重置。
 func (a *AccessLogStore) BatchAppend(batch *[]*model.AccessLog) error {
 	if batch == nil || len(*batch) == 0 {
 		return nil
@@ -216,9 +229,14 @@ func (a *AccessLogStore) BatchAppend(batch *[]*model.AccessLog) error {
 		if l == nil {
 			continue
 		}
+		if err := l.Validate(); err != nil {
+			logger.Warn("skip invalid access log", logger.Fields{"code": l.Code, "err": err.Error()})
+			continue
+		}
 		data, err := json.Marshal(l)
 		if err != nil {
-			return model.NewStoreError("MarshalLog", l.Code, err)
+			logger.Warn("skip unmarshalable access log", logger.Fields{"code": l.Code, "err": err.Error()})
+			continue
 		}
 		buf = append(buf, data...)
 		buf = append(buf, '\n')

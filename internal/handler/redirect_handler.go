@@ -21,7 +21,6 @@ import (
 // RedirectHandler 处理短码访问请求。
 type RedirectHandler struct {
 	svc         *service.RedirectService
-	pendingRef  *[]*model.AccessLog
 	flushTicker *time.Ticker
 	flushStop   chan struct{}
 	flushWG     sync.WaitGroup
@@ -34,10 +33,9 @@ func NewRedirectHandler(svc *service.RedirectService) (*RedirectHandler, error) 
 		return nil, model.ErrStoreNotReady
 	}
 	h := &RedirectHandler{
-		svc:        svc,
-		pendingRef: svc.PendingSlice(),
-		flushStop:  make(chan struct{}),
-		started:    true,
+		svc:       svc,
+		flushStop: make(chan struct{}),
+		started:   true,
 	}
 	interval := 200 * time.Millisecond
 	h.flushTicker = time.NewTicker(interval)
@@ -46,8 +44,9 @@ func NewRedirectHandler(svc *service.RedirectService) (*RedirectHandler, error) 
 	return h, nil
 }
 
-// runBackgroundFlush 周期性调用 RedirectService.BackgroundFlush，
-// 与请求路径内的 appendLog / AppendToPending 同时操作同一个 pending slice。
+// runBackgroundFlush 周期性调用 RedirectService.BackgroundFlush。
+// pending 批次的并发安全由 RedirectService 内部的互斥锁保证，
+// 这里只需周期性触发刷盘，无需直接操作内部 slice。
 func (h *RedirectHandler) runBackgroundFlush() {
 	defer h.flushWG.Done()
 	for {

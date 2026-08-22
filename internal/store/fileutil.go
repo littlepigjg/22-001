@@ -64,11 +64,13 @@ func WriteAtomic(path string, data []byte) error {
 }
 
 // OpenAppend 打开一个用于追加写入的文件，不存在则创建。
+// 使用 O_WRONLY|O_APPEND|O_CREATE：只写、每次 Write 原子地追加到文件末尾，
+// 避免并发写者互相覆盖彼此的内容。
 func OpenAppend(path string) (*os.File, error) {
 	if err := EnsureDir(path); err != nil {
 		return nil, err
 	}
-	return os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0o644)
+	return os.OpenFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o644)
 }
 
 // FileExists 返回给定路径是否存在常规文件。
