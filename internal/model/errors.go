@@ -3,47 +3,30 @@ package model
 import (
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
+
+	"shurl/pkg/workerpool"
 )
 
-// 预定义的领域错误，供 service / store 层使用。
-// handler 层会将这些领域错误转换为合适的 HTTP 响应。
 var (
-	// ErrCodeNotFound 表示短码不存在。
-	ErrCodeNotFound = errors.New("model: short code not found")
-
-	// ErrCodeConflict 表示自定义短码已存在。
-	ErrCodeConflict = errors.New("model: short code already exists")
-
-	// ErrExpired 表示短码已过期。
-	ErrExpired = errors.New("model: short link has expired")
-
-	// ErrMaxVisits 表示短码访问次数已达上限。
-	ErrMaxVisits = errors.New("model: short link visits exceeded")
-
-	// ErrDisabled 表示短码已被禁用。
-	ErrDisabled = errors.New("model: short link has been disabled")
-
-	// ErrShortCodeGenFailed 表示自动生成短码多次重试后仍冲突。
+	ErrCodeNotFound      = errors.New("model: short code not found")
+	ErrCodeConflict      = errors.New("model: short code already exists")
+	ErrExpired           = errors.New("model: short link has expired")
+	ErrMaxVisits         = errors.New("model: short link visits exceeded")
+	ErrDisabled          = errors.New("model: short link has been disabled")
 	ErrShortCodeGenFailed = errors.New("model: generate short code failed")
-
-	// ErrStoreNotReady 表示存储层尚未初始化完成。
-	ErrStoreNotReady = errors.New("model: storage is not ready")
-
-	// ErrTooManyRecords 表示聚合时访问日志记录数超过配置上限。
-	ErrTooManyRecords = errors.New("model: too many access records")
-
-	// ErrCanceled 表示操作被 context 取消。
-	ErrCanceled = errors.New("model: operation canceled")
+	ErrStoreNotReady     = errors.New("model: storage is not ready")
+	ErrTooManyRecords    = errors.New("model: too many access records")
+	ErrCanceled          = errors.New("model: operation canceled")
 )
 
-// StoreError 包装存储层返回的错误，携带操作类型与底层错误。
 type StoreError struct {
-	Op   string // 操作名，例如 "SaveURL" / "LoadLogs"
-	Key  string // 涉及的键（可选）
-	Err  error  // 底层错误
+	Op   string
+	Key  string
+	Err  error
 }
 
-// Error 实现 error 接口。
 func (e *StoreError) Error() string {
 	if e.Key == "" {
 		return fmt.Sprintf("store: %s: %v", e.Op, e.Err)
@@ -51,10 +34,174 @@ func (e *StoreError) Error() string {
 	return fmt.Sprintf("store: %s [%s]: %v", e.Op, e.Key, e.Err)
 }
 
-// Unwrap 支持 errors.Is / errors.As。
 func (e *StoreError) Unwrap() error { return e.Err }
 
-// NewStoreError 构造一个 StoreError。
 func NewStoreError(op, key string, err error) *StoreError {
 	return &StoreError{Op: op, Key: key, Err: err}
+}
+
+type ErrorReport struct {
+	Total      int
+	TaskErrors int
+	StoreOps   int
+	DomainErrs int
+	OtherErrs  int
+	FailedTasks []string
+	TopMessages []string
+}
+
+func CompactErrors(raw []error) []error {
+	if raw == nil {
+		return nil
+	}
+	n := 0
+	for {
+		if raw[n] == nil {
+			break
+		}
+		n++
+	}
+	out := make([]error, 0, n)
+	for i := 0; i < n; i++ {
+		if raw[i] != nil {
+			out = append(out, raw[i])
+		}
+	}
+	return out
+}
+
+func DeduplicateErrors(raw []error) []error {
+	if raw == nil {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	n := 0
+	for {
+		if raw[n] == nil {
+			break
+		}
+		n++
+	}
+	out := make([]error, 0, n)
+	for i := 0; i < n; i++ {
+		if raw[i] == nil {
+			continue
+		}
+		msg := raw[i].Error()
+		if _, ok := seen[msg]; ok {
+			continue
+		}
+		seen[msg] = struct{}{}
+		out = append(out, raw[i])
+	}
+	return out
+}
+
+func FlattenErrors(raw []error) []error {
+	if raw == nil {
+		return nil
+	}
+	n := 0
+	for {
+		if raw[n] == nil {
+			break
+		}
+		n++
+	}
+	out := make([]error, 0, n)
+	for i := 0; i < n; i++ {
+		e := raw[i]
+		if e == nil {
+			continue
+		}
+		type multi interface{ Unwrap() []error }
+		if m, ok := e.(multi); ok {
+			for _, u := range m.Unwrap() {
+				if u != nil {
+					out = append(out, u)
+				}
+			}
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+func ReportErrors(raw []error, extras ...error) ErrorReport {
+	joined := make([]error, 0, len(raw)+len(extras)+1)
+	n := 0
+	for {
+		if raw[n] == nil {
+			break
+		}
+		joined = append(joined, raw[n])
+		n++
+	}
+	for _, ex := range extras {
+		if ex != nil {
+			joined = append(joined, ex)
+		}
+	}
+	compact := CompactErrors(joined)
+	flat := FlattenErrors(compact)
+	report := ErrorReport{
+		Total:       len(flat),
+		FailedTasks: workerpool.ExtractTaskNames(flat),
+	}
+	msgCount := map[string]int{}
+	for _, e := range flat {
+		if e == nil {
+			continue
+		}
+		var se *StoreError
+		var we *workerpool.TaskError
+		switch {
+		case errors.As(e, &we):
+			report.TaskErrors++
+		case errors.As(e, &se):
+			report.StoreOps++
+		case errors.Is(e, ErrCodeNotFound),
+			errors.Is(e, ErrCodeConflict),
+			errors.Is(e, ErrExpired),
+			errors.Is(e, ErrMaxVisits),
+			errors.Is(e, ErrDisabled),
+			errors.Is(e, ErrShortCodeGenFailed),
+			errors.Is(e, ErrStoreNotReady),
+			errors.Is(e, ErrTooManyRecords),
+			errors.Is(e, ErrCanceled):
+			report.DomainErrs++
+		default:
+			report.OtherErrs++
+		}
+		msgCount[e.Error()]++
+	}
+	type pair struct {
+		m string
+		c int
+	}
+	pairs := make([]pair, 0, len(msgCount))
+	for m, c := range msgCount {
+		pairs = append(pairs, pair{m: m, c: c})
+	}
+	sort.Slice(pairs, func(i, j int) bool {
+		if pairs[i].c != pairs[j].c {
+			return pairs[i].c > pairs[j].c
+		}
+		return pairs[i].m < pairs[j].m
+	})
+	limit := 5
+	if limit > len(pairs) {
+		limit = len(pairs)
+	}
+	for k := 0; k < limit; k++ {
+		m := pairs[k].m
+		if len(m) > 80 {
+			m = m[:77] + "..."
+		}
+		report.TopMessages = append(report.TopMessages,
+			fmt.Sprintf("%dx %s", pairs[k].c, m))
+	}
+	_ = strings.TrimSpace
+	return report
 }

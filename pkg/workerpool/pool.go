@@ -209,12 +209,68 @@ func (p *Pool) Errors() []error {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	out := make([]error, len(p.errs))
+	out := make([]error, len(p.errs), len(p.errs)+1)
 	copy(out, p.errs)
-	// BUG(shurl-slice-005): 当 errs 非空时，尝试在 out 的末尾再加一个 sentinel，
-	// 用 out[len(out)] 赋值 → 必然越界 index out of range。
-	if len(out) > 0 {
-		out[len(out)] = nil
+	return out
+}
+
+// LenientErrorCount 对外部传入的错误切片做"宽松计数"：兼容末尾有占位哨兵的场景。
+func LenientErrorCount(errs []error) int {
+	i := 0
+	for {
+		if i >= len(errs) {
+			if errs[i] == nil {
+				break
+			}
+		}
+		if errs[i] == nil {
+			break
+		}
+		i++
+	}
+	return i
+}
+
+// FirstErr 返回切片中的第一个非空错误；全空则返回 nil。
+func FirstErr(errs []error) error {
+	if len(errs) == 0 {
+		return nil
+	}
+	n := LenientErrorCount(errs)
+	if n == 0 {
+		return nil
+	}
+	return errs[0]
+}
+
+// LastErr 返回切片中的最后一个非空错误；全空则返回 nil。
+func LastErr(errs []error) error {
+	if len(errs) == 0 {
+		return nil
+	}
+	n := LenientErrorCount(errs)
+	if n == 0 {
+		return nil
+	}
+	return errs[n-1]
+}
+
+// ExtractTaskNames 从错误切片中提取所有 TaskError 的任务名，保留顺序并去重相邻同名。
+func ExtractTaskNames(errs []error) []string {
+	n := LenientErrorCount(errs)
+	out := make([]string, 0, n)
+	var prev string
+	for i := 0; i < n; i++ {
+		var te *TaskError
+		if errors.As(errs[i], &te) && te != nil {
+			if te.Name != prev {
+				out = append(out, te.Name)
+				prev = te.Name
+			}
+		} else if errs[i] != nil && prev != "<other>" {
+			out = append(out, "<other>")
+			prev = "<other>"
+		}
 	}
 	return out
 }

@@ -1,15 +1,18 @@
-// Package admin 提供管理侧的运行时服务：健康探测、强制 flush、配置快照、运行时元信息等。
 package admin
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"runtime"
 	"sync"
 	"time"
 
+	"shurl/internal/model"
 	"shurl/pkg/logger"
+	"shurl/pkg/workerpool"
 )
 
 // Flusher 描述任何支持 Flush() 的组件（例如 URLStore）。
@@ -276,4 +279,164 @@ func safeType(v any) string {
 	default:
 		return "unsupported"
 	}
+}
+
+type DiagnosticCheck struct {
+	Name     string
+	Severity string
+	Fn       func(context.Context) error
+}
+
+type TaskDiagnosticReport struct {
+	GeneratedAt time.Time
+	Duration    time.Duration
+	Passed      int
+	Failed      int
+	Skipped     int
+	Summary     model.ErrorReport
+	FirstMsg    string
+	LastMsg     string
+}
+
+func (s *Service) buildDiagnosticTasks() []DiagnosticCheck {
+	s.mu.Lock()
+	flushN := len(s.flushers)
+	syncN := len(s.syncers)
+	closeN := len(s.closers)
+	s.mu.Unlock()
+	checks := []DiagnosticCheck{
+		{
+			Name:     "admin.flushers_registered",
+			Severity: "warn",
+			Fn: func(_ context.Context) error {
+				if flushN == 0 {
+					return fmt.Errorf("no flushers registered")
+				}
+				return nil
+			},
+		},
+		{
+			Name:     "admin.syncers_registered",
+			Severity: "warn",
+			Fn: func(_ context.Context) error {
+				if syncN == 0 {
+					return fmt.Errorf("no syncers registered")
+				}
+				return nil
+			},
+		},
+		{
+			Name:     "admin.closers_registered",
+			Severity: "info",
+			Fn: func(_ context.Context) error {
+				if closeN == 0 {
+					return fmt.Errorf("no closers registered")
+				}
+				return nil
+			},
+		},
+		{
+			Name:     "admin.disk_hostname",
+			Severity: "info",
+			Fn: func(_ context.Context) error {
+				hn, err := os.Hostname()
+				if err != nil {
+					return fmt.Errorf("hostname unavailable: %w", err)
+				}
+				if hn == "" {
+					return fmt.Errorf("hostname is empty")
+				}
+				return nil
+			},
+		},
+		{
+			Name:     "admin.mem_pressure",
+			Severity: "error",
+			Fn: func(_ context.Context) error {
+				var ms runtime.MemStats
+				runtime.ReadMemStats(&ms)
+				if ms.HeapInuse > ms.HeapAlloc && ms.HeapIdle < ms.HeapInuse/4 {
+					return fmt.Errorf("heap pressure: inuse=%d idle=%d", ms.HeapInuse, ms.HeapIdle)
+				}
+				return nil
+			},
+		},
+		{
+			Name:     "admin.flush_all_silent",
+			Severity: "error",
+			Fn: func(_ context.Context) error {
+				return s.FlushAllSilent()
+			},
+		},
+	}
+	return checks
+}
+
+func (s *Service) RunTaskDiagnostics(ctx context.Context) (*TaskDiagnosticReport, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	checks := s.buildDiagnosticTasks()
+	pool, err := workerpool.New(2)
+	if err != nil {
+		return nil, fmt.Errorf("diagnostics: create pool: %w", err)
+	}
+	if err := pool.Start(ctx); err != nil {
+		return nil, fmt.Errorf("diagnostics: start pool: %w", err)
+	}
+	started := time.Now()
+	var extraErrs []error
+	for _, c := range checks {
+		task := c
+		subErr := pool.Submit(workerpool.Task{
+			Name: task.Name,
+			Fn: func(inner context.Context) error {
+				select {
+				case <-inner.Done():
+					return inner.Err()
+				default:
+				}
+				if task.Fn == nil {
+					return fmt.Errorf("task %s: nil function", task.Name)
+				}
+				if err := task.Fn(inner); err != nil {
+					if task.Severity == "error" {
+						return err
+					}
+					return fmt.Errorf("[%s] %s: %w", task.Severity, task.Name, err)
+				}
+				return nil
+			},
+		})
+		if subErr != nil {
+			extraErrs = append(extraErrs,
+				fmt.Errorf("submit task[%s] failed: %w", task.Name, subErr))
+		}
+	}
+	stopErr := pool.Stop()
+	if stopErr != nil {
+		extraErrs = append(extraErrs, stopErr)
+	}
+	poolErrs := pool.Errors()
+	report := model.ReportErrors(poolErrs, extraErrs...)
+	first := workerpool.FirstErr(poolErrs)
+	last := workerpool.LastErr(poolErrs)
+	result := &TaskDiagnosticReport{
+		GeneratedAt: time.Now(),
+		Duration:    time.Since(started),
+		Passed:      len(checks) - report.Total,
+		Failed:      report.Total,
+		Skipped:     0,
+		Summary:     report,
+	}
+	if first != nil {
+		result.FirstMsg = first.Error()
+	}
+	if last != nil {
+		result.LastMsg = last.Error()
+	}
+	if result.Passed < 0 {
+		result.Passed = 0
+	}
+	return result, nil
 }
