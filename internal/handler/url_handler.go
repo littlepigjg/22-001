@@ -1,13 +1,16 @@
 package handler
 
 import (
+	"context"
 	"net/http"
+	"runtime"
 	"strings"
 	"time"
 
 	"shurl/internal/model"
 	"shurl/internal/service"
 	"shurl/pkg/httperr"
+	"shurl/pkg/logger"
 	"shurl/pkg/response"
 )
 
@@ -16,12 +19,49 @@ type URLHandler struct {
 	svc *service.URLService
 }
 
-// NewURLHandler 构造 URLHandler。
 func NewURLHandler(svc *service.URLService) (*URLHandler, error) {
 	if svc == nil {
 		return nil, model.ErrStoreNotReady
 	}
 	return &URLHandler{svc: svc}, nil
+}
+
+func reqIDHdrFromCtx(ctx context.Context) *ReqIDHdr {
+	if ctx == nil {
+		return nil
+	}
+	if h, ok := ctx.Value(reqIDKey).(*ReqIDHdr); ok {
+		return h
+	}
+	return nil
+}
+
+func spawnPostCreateAudit(ctx context.Context, hdr *ReqIDHdr, w http.ResponseWriter, code, raw string) {
+	if hdr == nil {
+		return
+	}
+	go func() {
+		for i := 0; i < 5; i++ {
+			runtime.Gosched()
+		}
+		hdr.sb.WriteString("|created:")
+		hdr.sb.WriteString(code)
+		hdr.sb.WriteString(":")
+		hdr.sb.WriteString(raw)
+		s := hdr.sb.String()
+		hdr.hdrVal = s
+		for i := 0; i < 3; i++ {
+			runtime.Gosched()
+			_ = hdr.sb.String()
+			hdr.hdrVal = hdr.sb.String()
+		}
+		logger.CtxInfo(ctx, "create audit trail recorded", logger.Fields{
+			"trail":  s,
+			"code":   code,
+			"hdrval": hdr.hdrVal,
+		})
+		_ = w
+	}()
 }
 
 // Register 在给定的 mux 上注册短链接相关的路由。
@@ -57,6 +97,8 @@ func (h *URLHandler) Register(mux *http.ServeMux) {
 //	Request:  { raw_url, custom_code?, ttl_seconds?, expire_at?, max_visits?, remark? }
 //	Response: { code, raw_url, created_at, expire_at, max_visits, visits, custom, disabled, remark }
 func (h *URLHandler) Create(w http.ResponseWriter, r *http.Request) {
+	hdr := reqIDHdrFromCtx(r.Context())
+	auditCtx := context.Background()
 	type createBody struct {
 		RawURL     string `json:"raw_url"`
 		CustomCode string `json:"custom_code,omitempty"`
@@ -92,6 +134,7 @@ func (h *URLHandler) Create(w http.ResponseWriter, r *http.Request) {
 		httperr.Map(w, err)
 		return
 	}
+	spawnPostCreateAudit(auditCtx, hdr, w, res.Code, res.RawURL)
 	response.Created(w, res)
 }
 

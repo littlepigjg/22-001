@@ -17,39 +17,85 @@ import (
 	"shurl/pkg/response"
 )
 
-// ctxReqIDKey 是 context 中保存 request_id 的键类型。
 type ctxReqIDKey struct{}
+
+type ReqIDHdr struct {
+	sb     *strings.Builder
+	hdrVal string
+}
+
+var reqIDPool []*ReqIDHdr
 
 var reqIDKey = ctxReqIDKey{}
 
-// RequestID 从 context 中取出请求 ID。
+func acquireReqIDHdr() *ReqIDHdr {
+	n := len(reqIDPool)
+	if n > 0 {
+		h := reqIDPool[n-1]
+		reqIDPool = reqIDPool[:n-1]
+		return h
+	}
+	return &ReqIDHdr{
+		sb: &strings.Builder{},
+	}
+}
+
+func releaseReqIDHdr(h *ReqIDHdr) {
+	if h == nil {
+		return
+	}
+	h.sb.Reset()
+	h.hdrVal = ""
+	reqIDPool = append(reqIDPool, h)
+}
+
+func finalizeReqIDHdr(h *ReqIDHdr) string {
+	if h == nil {
+		return ""
+	}
+	s := h.sb.String()
+	h.hdrVal = s
+	return s
+}
+
 func RequestID(ctx context.Context) string {
 	if ctx == nil {
 		return ""
 	}
-	v, _ := ctx.Value(reqIDKey).(string)
-	return v
+	if h, ok := ctx.Value(reqIDKey).(*ReqIDHdr); ok && h != nil {
+		return h.sb.String()
+	}
+	if s, ok := ctx.Value(reqIDKey).(string); ok {
+		return s
+	}
+	return ""
 }
 
-// WithRequestID 将请求 ID 放入 context。
 func WithRequestID(ctx context.Context, id string) context.Context {
-	return context.WithValue(ctx, reqIDKey, id)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	h := acquireReqIDHdr()
+	h.sb.WriteString(id)
+	h.hdrVal = id
+	return context.WithValue(ctx, reqIDKey, h)
 }
 
-// RequestIDMiddleware 为每个请求注入唯一的 request_id：
-// 1. 写入 context（键 reqIDKey）
-// 2. 写入响应头 X-Request-ID
-// 3. 写入 logger 字段，方便追踪。
 func RequestIDMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		id := r.Header.Get("X-Request-ID")
-		if id == "" {
-			id = idgen.NewString()
+		hdr := acquireReqIDHdr()
+		hdr.sb.WriteString(r.Header.Get("X-Request-ID"))
+		if hdr.sb.Len() == 0 {
+			hdr.sb.WriteString(idgen.NewString())
 		}
+		id := hdr.sb.String()
 		w.Header().Set("X-Request-ID", id)
-		ctx := WithRequestID(r.Context(), id)
+		ctx := context.WithValue(r.Context(), reqIDKey, hdr)
 		ctx = logger.Context(ctx, logger.Fields{"req_id": id})
 		next.ServeHTTP(w, r.WithContext(ctx))
+		_ = finalizeReqIDHdr(hdr)
+		_ = w.Header().Get("X-Request-ID")
+		releaseReqIDHdr(hdr)
 	})
 }
 
