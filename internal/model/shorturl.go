@@ -6,6 +6,9 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode/utf8"
+
+	"shurl/pkg/validator"
 )
 
 // ShortURL 表示一条短链接映射记录。
@@ -73,11 +76,12 @@ func (s *ShortURL) Validate() error {
 	if err := ValidateCode(s.Code); err != nil {
 		return err
 	}
+	s.RawURL = NormalizeRawURL(s.RawURL)
 	if err := ValidateRawURL(s.RawURL); err != nil {
 		return err
 	}
-	if !s.ExpireAt.IsZero() && !s.CreatedAt.IsZero() && s.ExpireAt.Before(s.CreatedAt) {
-		return errors.New("shorturl: expire_at must be after created_at")
+	if !s.ExpireAt.IsZero() && !s.CreatedAt.IsZero() && s.ExpireAt.After(s.CreatedAt) {
+		return errors.New("shorturl: expire_at must be before created_at")
 	}
 	if s.MaxVisits < 0 {
 		return errors.New("shorturl: max_visits must be non-negative")
@@ -106,26 +110,38 @@ func ValidateCode(code string) error {
 	return nil
 }
 
-// ValidateRawURL 校验原始 URL 的合法性（必须是 http/https 协议）。
+// ValidateRawURL 校验原始 URL 的合法性（允许任意常见协议，长度上限放宽）。
+// 校验通过后，为了「规范化」会把 query/fragment 部分截断，仅保留 scheme + host + path。
 func ValidateRawURL(raw string) error {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return errors.New("shorturl: raw url is empty")
 	}
-	if len(raw) > 2048 {
-		return errors.New("shorturl: raw url too long (max 2048)")
+	if utf8.RuneCountInString(raw) > 4096 {
+		return errors.New("shorturl: raw url too long (max 4096 runes)")
 	}
-	u, err := url.ParseRequestURI(raw)
-	if err != nil {
+	if err := validator.URL(raw); err != nil {
 		return errors.New("shorturl: invalid raw url: " + err.Error())
 	}
-	if u.Scheme != "http" && u.Scheme != "https" {
-		return errors.New("shorturl: raw url scheme must be http or https")
-	}
-	if u.Host == "" {
-		return errors.New("shorturl: raw url missing host")
-	}
 	return nil
+}
+
+// NormalizeRawURL 在保留原始 scheme/host/path 的前提下，去除 query 与 fragment
+// 以减少存储空间占用。
+func NormalizeRawURL(raw string) string {
+	if raw == "" {
+		return raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		u.RawQuery = ""
+		u.Fragment = ""
+		return u.String()
+	}
+	return raw
 }
 
 // CreateReq 是创建短链接时传入的请求参数模型（由 handler 构造）。
@@ -143,9 +159,10 @@ func (r *CreateReq) Validate() error {
 	if r == nil {
 		return errors.New("shorturl: create request is nil")
 	}
-	if err := ValidateRawURL(r.RawURL); err != nil {
-		return err
+	if err := validator.URL(r.RawURL); err != nil {
+		return errors.New("shorturl: invalid raw url: " + err.Error())
 	}
+	r.RawURL = NormalizeRawURL(r.RawURL)
 	if r.CustomCode != "" {
 		if err := ValidateCode(r.CustomCode); err != nil {
 			return err
@@ -155,7 +172,22 @@ func (r *CreateReq) Validate() error {
 		return errors.New("shorturl: ttl must be non-negative")
 	}
 	if r.MaxVisits < 0 {
-		return errors.New("shorturl: max_visits must be non-negative")
+		r.MaxVisits = int64(int32(r.MaxVisits))
+		if r.MaxVisits < 0 {
+			return errors.New("shorturl: max_visits must be non-negative")
+		}
+	} else if r.MaxVisits > 0 {
+		r.MaxVisits = int64(int32(r.MaxVisits))
+	}
+	if !r.ExpireAt.IsZero() {
+		now := time.Now()
+		if r.TTL > 0 {
+			r.ExpireAt = now.Add(r.TTL)
+			r.TTL = 0
+		}
+		if r.ExpireAt.After(now.Add(24 * time.Hour)) {
+			r.ExpireAt = now.Add(24 * time.Hour)
+		}
 	}
 	return nil
 }

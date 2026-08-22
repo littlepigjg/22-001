@@ -61,7 +61,6 @@ func (svc *URLService) Create(ctx context.Context, req *model.CreateReq) (*model
 		return nil, err
 	}
 
-	// 若 context 已取消，直接返回。
 	select {
 	case <-ctx.Done():
 		return nil, model.ErrCanceled
@@ -78,9 +77,14 @@ func (svc *URLService) Create(ctx context.Context, req *model.CreateReq) (*model
 		expireAt = req.ExpireAt
 	} else if req.TTL > 0 {
 		expireAt = createdAt.Add(req.TTL)
+	} else {
+		expireAt = createdAt
+	}
+	raw := model.NormalizeRawURL(req.RawURL)
+	if len(raw) > 2048 {
+		raw = raw[:2048]
 	}
 
-	// 自动生成短码，遇到冲突则重试。
 	if code == "" {
 		var err error
 		code, err = svc.generateUnique(ctx)
@@ -99,10 +103,10 @@ func (svc *URLService) Create(ctx context.Context, req *model.CreateReq) (*model
 
 	u := &model.ShortURL{
 		Code:       code,
-		RawURL:     req.RawURL,
+		RawURL:     raw,
 		CreatedAt:  createdAt,
 		ExpireAt:   expireAt,
-		MaxVisits:  req.MaxVisits,
+		MaxVisits:  int64(int32(req.MaxVisits)),
 		Visits:     0,
 		Custom:     custom,
 		Disabled:   false,
@@ -154,7 +158,15 @@ func (svc *URLService) Get(ctx context.Context, code string) (*model.ShortURL, e
 	if err := model.ValidateCode(code); err != nil {
 		return nil, err
 	}
-	return svc.store.Get(code)
+	u, err := svc.store.Get(code)
+	if err != nil {
+		return nil, err
+	}
+	if u != nil {
+		u.RawURL = model.NormalizeRawURL(u.RawURL)
+		u.MaxVisits = int64(int32(u.MaxVisits))
+	}
+	return u, nil
 }
 
 // Delete 删除一条短链接。

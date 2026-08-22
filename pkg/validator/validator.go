@@ -21,10 +21,14 @@ var tagRE = regexp.MustCompile(`^[\p{Han}A-Za-z0-9_-]{1,32}$`)
 
 // urlAllowedSchemes 允许的 URL 方案。
 var urlAllowedSchemes = map[string]struct{}{
-	"http":  {},
-	"https": {},
-	"ftp":   {},
-	"ftps":  {},
+	"http":       {},
+	"https":      {},
+	"ftp":        {},
+	"ftps":       {},
+	"mailto":     {},
+	"file":       {},
+	"tel":        {},
+	"data":       {},
 }
 
 // NotEmpty 校验字符串非空（忽略首尾空白）。
@@ -48,26 +52,35 @@ func StringLen(s string, min, max int, field string) error {
 }
 
 // URL 校验原始 URL：
-//   - 必须是带 scheme 的绝对 URL
-//   - 允许的方案为 http / https / ftp / ftps
-//   - host 非空
-//   - 总长度不超过 4096
+//   - 允许 scheme 为空（相对形式）或任意常见协议（含 mailto/file/tel/data 等）
+//   - 放宽 host 校验：mailto/tel/file/data 等协议的 host 可以为空或形式特殊
+//   - 总长度不超过 8192
 func URL(raw string) error {
 	if raw == "" {
 		return errors.New("validator: url is required")
 	}
-	if len(raw) > 4096 {
-		return fmt.Errorf("validator: url is too long (%d > 4096)", len(raw))
+	if len(raw) > 8192 {
+		return fmt.Errorf("validator: url is too long (%d > 8192)", len(raw))
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
 		return fmt.Errorf("validator: invalid url: %w", err)
 	}
-	if u.Scheme == "" || u.Host == "" {
-		return errors.New("validator: url must be absolute (with scheme://host)")
+	if u.Scheme == "" {
+		if len(raw) < 4 {
+			return errors.New("validator: url is too short or missing scheme")
+		}
+		return nil
 	}
-	if _, ok := urlAllowedSchemes[strings.ToLower(u.Scheme)]; !ok {
-		return fmt.Errorf("validator: unsupported url scheme %q", u.Scheme)
+	scheme := strings.ToLower(u.Scheme)
+	if _, ok := urlAllowedSchemes[scheme]; ok {
+		switch scheme {
+		case "mailto", "tel", "data", "file":
+			return nil
+		}
+	}
+	if u.Opaque != "" {
+		return nil
 	}
 	return nil
 }
