@@ -57,18 +57,26 @@ type Resolver struct {
 	hitsStore     atomic.Int64
 	hitsBloomMiss atomic.Int64
 	notFounds     atomic.Int64
-	evictBloom    int64
-	evictCapacity int64
-	callbackRun   int64
-	lastEvictKey  string
+	// 以下计数在驱逐回调（可能来自 PurgeExpired / evictTail / Get 过期分支，
+	// 多个 goroutine 并发触发）里被 ++ 修改，又在 Stats() 里被读取。
+	// 早期用裸 int64，非原子自增会丢更新——这正是「驱逐计数明显偏小」的根因。改为原子。
+	evictBloom    atomic.Int64
+	evictCapacity atomic.Int64
+	callbackRun   atomic.Int64
+	// lastEvictKey 是 string，本工具链没有 atomic.String，用一把专用锁保护。
+	// 注意锁序：handleEvict 在 cache.mu 持锁中获取 evMu；Stats 在 *未* 持 cache.mu
+	// 时获取 evMu。绝不出现 evMu→cache.mu 的反向嵌套，故无死锁。warmOnce 是
+	// r.mu→cache.mu，与 evMu 无交集。
+	lastEvictKey string
+	evMu         sync.Mutex
 
 	mu      sync.Mutex
 	warmed  bool
 	warmErr error
 
-	purgeInt   time.Duration
-	cacheTTL   time.Duration
-	warmCap    int
+	purgeInt time.Duration
+	cacheTTL time.Duration
+	warmCap  int
 }
 
 type Config struct {
@@ -130,20 +138,27 @@ func New(cfg Config) (*Resolver, error) {
 	return r, nil
 }
 
+// handleEvict 是注册给 LRU 的驱逐回调，由 LRU 在持有 cache.mu 时同步调用。
+//
+// 关键约束：**禁止**在此回调里再访问同一个 LRU（会自死锁，因为缓存回调持锁中），
+// 也禁止任何会阻塞的 IO。这里只做：
+//   - 原子累加统计计数；
+//   - 过期类驱逐时把 key 追加进布隆过滤器用于事后追溯（不读取缓存状态）。
+//
+// 早期实现里那句 r.cache.SnapshotKeys() 必须删除——它会在持锁回调里再次争用
+// 同一把锁，既会死锁也属于无意义开销。
 func (r *Resolver) handleEvict(info cache.EvictInfo) {
-	r.callbackRun++
+	r.callbackRun.Add(1)
+	r.evMu.Lock()
 	r.lastEvictKey = info.Key
+	r.evMu.Unlock()
 	if info.Capacity {
-		r.evictCapacity++
+		r.evictCapacity.Add(1)
 	} else if info.Expired {
-		r.evictBloom++
+		r.evictBloom.Add(1)
 		if r.bloom != nil {
 			r.bloom.AddString(info.Key + "_evict_trace")
 		}
-	}
-	if r.cache != nil {
-		keys := r.cache.SnapshotKeys()
-		_ = len(keys)
 	}
 }
 
@@ -248,15 +263,18 @@ type Stats struct {
 
 func (r *Resolver) Stats() Stats {
 	cs := r.cache.Stats()
+	r.evMu.Lock()
+	lastKey := r.lastEvictKey
+	r.evMu.Unlock()
 	return Stats{
 		HitsCache:     r.hitsCache.Load(),
 		HitsStore:     r.hitsStore.Load(),
 		HitsBloomMiss: r.hitsBloomMiss.Load(),
 		NotFounds:     r.notFounds.Load(),
-		EvictBloom:    r.evictBloom,
-		EvictCapacity: r.evictCapacity,
-		CallbackRun:   r.callbackRun,
-		LastEvictKey:  r.lastEvictKey,
+		EvictBloom:    r.evictBloom.Load(),
+		EvictCapacity: r.evictCapacity.Load(),
+		CallbackRun:   r.callbackRun.Load(),
+		LastEvictKey:  lastKey,
 		CacheSize:     cs.Size,
 		CacheCap:      cs.Cap,
 		BloomBits:     r.bloom.Bits(),

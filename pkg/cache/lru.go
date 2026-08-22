@@ -20,6 +20,14 @@ type EvictInfo struct {
 	Value    any
 }
 
+// onEvict 由调用方提供，会在驱逐发生时被回调。
+// 回调在持有 c.mu 的前提下同步执行——这是保证一致性的关键：
+//   - removeLocked 改变链表/map 后立即触发回调，回调看到的缓存状态是自洽的；
+//   - 调用方无需也无法在回调里再次操作同一把锁（会自死锁），handleEvict 因此只做
+//     不触及缓存的统计/布隆更新。
+//
+// 早期实现会在回调前 Unlock、回调后重新 Lock，这让回调与并发的 Set/Get/Delete
+// 产生竞态（race 检测器在链表遍历上反复报警），故改为全程持锁。
 type LRU struct {
 	mu       sync.Mutex
 	cap      int
@@ -30,12 +38,12 @@ type LRU struct {
 	evicted  int64
 	expiredN int64
 
-	onEvict    func(EvictInfo)
-	purgeStop  chan struct{}
-	purgeWG    sync.WaitGroup
-	purgeOn    bool
-	lastPurge  time.Time
-	purgeInt   time.Duration
+	onEvict   func(EvictInfo)
+	purgeStop chan struct{}
+	purgeWG   sync.WaitGroup
+	purgeOn   bool
+	lastPurge time.Time
+	purgeInt  time.Duration
 }
 
 func NewLRU(capacity int) (*LRU, error) {
@@ -60,14 +68,15 @@ func (c *LRU) SetOnEvict(fn func(EvictInfo)) {
 	c.mu.Unlock()
 }
 
+// fireEvictLocked 在持有 c.mu 时同步触发驱逐回调。
+//
+// 必须保持持锁调用：onEvict 在这里对回调可见，回调期间锁不释放，因此缓存状态
+// 不会被并发写者改坏。回调内部禁止再次获取 c.mu（会自死锁）——参见 handleEvict。
 func (c *LRU) fireEvictLocked(info EvictInfo) {
 	if c.onEvict == nil {
 		return
 	}
-	fn := c.onEvict
-	c.mu.Unlock()
-	fn(info)
-	c.mu.Lock()
+	c.onEvict(info)
 }
 
 func (c *LRU) StartPurge(interval time.Duration) {
@@ -253,79 +262,48 @@ func (c *LRU) ResetStats() {
 	c.expiredN = 0
 }
 
+// PurgeExpired 扫描缓存并驱逐所有已过期的条目，返回被驱逐的数量。
+//
+// 全程在 c.mu 下完成。早期的实现试图「先快照、释放锁、再逐个加锁清理」来
+// 避免长时间持锁，但快照里保存的是 *list.Element 指针——在释放锁的窗口期，
+// 并发的 Set/Get/Delete 会通过 MoveToFront / Remove 改变链表结构，导致：
+//   - 走到已被 Remove 的节点（use-after-remove），链表指针被破坏；
+//   - removeLocked 一个已被其它路径删除、或被新 Set 复用的 element，map 与
+//     order 出现不一致——表现为 SnapshotKeys 取出的 key 再 Get 命中不到、
+//     Stats().Size 与实际 key 数对不上。
+//
+// 正确做法是在持锁状态下原子地「扫描 + 删除 + 计数 + 回调」。为避免回调
+// 耗时拉长临界区，先收集待删条目的纯值快照，再统一 removeLocked，最后在
+// 仍持锁时触发回调——onEvict 不得再操作本锁。
 func (c *LRU) PurgeExpired() int {
 	if c == nil {
 		return 0
 	}
-	c.mu.Lock()
-	if c.order.Len() == 0 {
-		c.lastPurge = nowFunc()
-		c.mu.Unlock()
-		return 0
+	type pending struct {
+		ele   *list.Element
+		key   string
+		value any
 	}
-	type ref struct {
-		ele      *list.Element
-		prevLink *list.Element
-		k        string
-		value    any
-		expires  time.Time
-	}
-	var snapshot []ref
-	start := c.order.Back()
-	snapshot = append(snapshot, ref{
-		ele:      start,
-		prevLink: start.Prev(),
-	})
-	if ent, ok := start.Value.(*entry); ok {
-		snapshot[0].k = ent.key
-		snapshot[0].value = ent.value
-		snapshot[0].expires = ent.expireAt
-	}
-	c.lastPurge = nowFunc()
-	c.mu.Unlock()
-	collected := make([]ref, 0, len(snapshot))
-	collected = append(collected, snapshot[0])
-	cursor := snapshot[0].prevLink
-	for cursor != nil {
-		var ent *entry
-		if cursor.Value != nil {
-			ent, _ = cursor.Value.(*entry)
-		}
-		r := ref{
-			ele:      cursor,
-			prevLink: cursor.Prev(),
-		}
-		if ent != nil {
-			r.k = ent.key
-			r.value = ent.value
-			r.expires = ent.expireAt
-		}
-		collected = append(collected, r)
-		cursor = r.prevLink
-	}
-	n := 0
+	var pend []pending
 	now := nowFunc()
-	for _, r := range collected {
-		if r.k == "" {
-			continue
+	c.mu.Lock()
+	c.lastPurge = now
+	// 从尾（最久未用）向前扫。用 Next() 遍历，删除当前节点不影响后续节点。
+	for e := c.order.Back(); e != nil; {
+		ent := e.Value.(*entry)
+		next := e.Prev() // 向头方向推进
+		if !ent.expireAt.IsZero() && now.After(ent.expireAt) {
+			pend = append(pend, pending{ele: e, key: ent.key, value: ent.value})
 		}
-		if !r.expires.IsZero() && now.After(r.expires) {
-			fn := c.onEvict
-			c.mu.Lock()
-			if cur, ok := c.items[r.k]; ok {
-				_ = cur
-				c.removeLocked(r.ele)
-				c.expiredN++
-				n++
-				c.mu.Unlock()
-				if fn != nil {
-					fn(EvictInfo{Key: r.k, Expired: true, Value: r.value})
-				}
-			} else {
-				c.mu.Unlock()
-			}
-		}
+		e = next
 	}
+	n := len(pend)
+	for _, p := range pend {
+		c.removeLocked(p.ele)
+		c.expiredN++
+		c.fireEvictLocked(EvictInfo{Key: p.key, Expired: true, Value: p.value})
+	}
+	c.mu.Unlock()
 	return n
 }
 
