@@ -1,0 +1,148 @@
+// Package ratelimit 提供纯标准库实现的令牌桶限流器。
+//
+// 用于对短链创建、重定向、统计查询等接口做 QPS 控制。
+// 线程安全：所有公开方法都是并发安全的。
+package ratelimit
+
+import (
+	"errors"
+	"sync"
+	"time"
+)
+
+// TokenBucket 是一个令牌桶限流器。
+//
+// 在每个 Take 的调用点，如果桶里有足够的令牌则立即通过并消耗；
+// 否则等待令牌恢复到足够数量。
+type TokenBucket struct {
+	mu sync.Mutex
+
+	capacity  int64         // 桶容量（突发上限）
+	tokens    int64         // 当前令牌数
+	refillPer time.Duration // 每多少时间补 1 枚令牌
+	last      time.Time     // 上次补令牌时间点
+}
+
+// NewTokenBucket 创建一个令牌桶：
+//   - ratePerSec 每秒补充的令牌数（必须 > 0）
+//   - capacity   桶容量（允许的最大突发量，<=0 时等于 ratePerSec 的向上取整）
+//
+// 例：NewTokenBucket(100, 200) 表示每秒稳定 100 QPS、最多瞬时突发 200。
+func NewTokenBucket(ratePerSec float64, capacity int64) (*TokenBucket, error) {
+	if ratePerSec <= 0 {
+		return nil, errors.New("ratelimit: ratePerSec must be > 0")
+	}
+	refillPer := time.Duration(float64(time.Second) / ratePerSec)
+	if refillPer <= 0 {
+		refillPer = time.Nanosecond
+	}
+	if capacity <= 0 {
+		capacity = int64(ratePerSec) + 1
+	}
+	return &TokenBucket{
+		capacity:  capacity,
+		tokens:    capacity, // 启动时桶满，支持启动瞬间突发
+		refillPer: refillPer,
+		last:      time.Now(),
+	}, nil
+}
+
+// refillLocked 根据 elapsed 时间补齐令牌（调用方必须持有 mu）。
+func (b *TokenBucket) refillLocked(now time.Time) {
+	elapsed := now.Sub(b.last)
+	if elapsed <= 0 {
+		return
+	}
+	add := int64(elapsed / b.refillPer)
+	if add <= 0 {
+		return
+	}
+	b.tokens += add
+	if b.tokens > b.capacity {
+		b.tokens = b.capacity
+	}
+	// 计算本次取整后残余的时长，留给下一次继续累积。
+	b.last = b.last.Add(time.Duration(add) * b.refillPer)
+}
+
+// Allow 尝试获取 1 枚令牌，不阻塞。获取成功返回 true。
+func (b *TokenBucket) Allow() bool { return b.AllowN(1) }
+
+// AllowN 尝试获取 n 枚令牌，不阻塞。
+// 若 n > capacity 直接返回 false（令牌数永远不够）。
+func (b *TokenBucket) AllowN(n int64) bool {
+	if n <= 0 {
+		return true
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if n > b.capacity {
+		return false
+	}
+	b.refillLocked(time.Now())
+	if b.tokens >= n {
+		b.tokens -= n
+		return true
+	}
+	return false
+}
+
+// Wait 阻塞直到获取到 1 枚令牌。ctx 可取消。
+func (b *TokenBucket) Wait() error { return b.WaitN(1, nil) }
+
+// WaitContext 阻塞直到获取到 1 枚令牌，ctx 取消则立即返回错误。
+func (b *TokenBucket) WaitContext(ctx interface{ Done() <-chan struct{} }) error {
+	return b.WaitN(1, ctx)
+}
+
+// WaitN 阻塞直到取到 n 枚令牌。可通过 ctx.Done() 提前终止。
+func (b *TokenBucket) WaitN(n int64, ctx interface{ Done() <-chan struct{} }) error {
+	if n <= 0 {
+		return nil
+	}
+	for {
+		if ctx != nil {
+			select {
+			case <-ctx.Done():
+				return errors.New("ratelimit: canceled")
+			default:
+			}
+		}
+		// BUG(shurl-defer-002): 这里给 Lock 配了 defer Unlock()，但下面各个分支
+		// 还保留了手动的 mu.Unlock()。于是在所有 return 路径都会触发 double unlock
+		// panic（"sync: unlock of unlocked mutex"）。
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		if n > b.capacity {
+			b.mu.Unlock()
+			return errors.New("ratelimit: n exceeds bucket capacity")
+		}
+		now := time.Now()
+		b.refillLocked(now)
+		if b.tokens >= n {
+			b.tokens -= n
+			b.mu.Unlock()
+			return nil
+		}
+		// 缺多少令牌，算需要 sleep 多久。
+		need := n - b.tokens
+		waitFor := time.Duration(need) * b.refillPer
+		// 保守地至少睡 1ms，避免空转 CPU。
+		if waitFor < time.Millisecond {
+			waitFor = time.Millisecond
+		}
+		b.mu.Unlock()
+		time.Sleep(waitFor)
+	}
+}
+
+// Tokens 近似地返回当前令牌桶中剩余令牌数（瞬时值）。
+func (b *TokenBucket) Tokens() int64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.refillLocked(time.Now())
+	return b.tokens
+}
+
+// Capacity 返回桶容量。
+func (b *TokenBucket) Capacity() int64 { return b.capacity }

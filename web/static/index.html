@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SHURL - 短链接生成与访问追踪服务</title>
+  <style>
+    :root {
+      --primary: #4f46e5;
+      --primary-hover: #4338ca;
+      --bg: #f8fafc;
+      --card: #ffffff;
+      --text: #0f172a;
+      --muted: #64748b;
+      --border: #e2e8f0;
+      --danger: #ef4444;
+      --success: #10b981;
+      --warn: #f59e0b;
+    }
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 0; }
+    header { background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%); color: #fff; padding: 40px 24px; }
+    header .wrap { max-width: 960px; margin: 0 auto; }
+    header h1 { margin: 0 0 8px 0; font-size: 28px; }
+    header p  { margin: 0; opacity: 0.9; }
+    main { max-width: 960px; margin: -24px auto 40px auto; padding: 0 24px; }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 24px; box-shadow: 0 1px 3px rgba(15, 23, 42, 0.05); margin-bottom: 20px; }
+    .card h2 { margin: 0 0 16px 0; font-size: 18px; }
+    .row { display: grid; grid-template-columns: 1fr; gap: 12px; }
+    @media(min-width: 640px) {
+      .row.cols-2 { grid-template-columns: 1fr 1fr; }
+      .row.cols-3 { grid-template-columns: 2fr 1fr 1fr; }
+    }
+    label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+    input, select, textarea, button { font: inherit; }
+    input, select, textarea {
+      width: 100%; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px;
+      outline: none; background: #fff; transition: border-color .15s, box-shadow .15s;
+    }
+    input:focus, select:focus, textarea:focus {
+      border-color: var(--primary); box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.15);
+    }
+    .btn {
+      padding: 10px 16px; border: none; border-radius: 8px; background: var(--primary); color: #fff;
+      cursor: pointer; font-weight: 500; transition: background .15s;
+    }
+    .btn:hover { background: var(--primary-hover); }
+    .btn.secondary { background: #e2e8f0; color: var(--text); }
+    .btn.secondary:hover { background: #cbd5e1; }
+    .btn.danger { background: var(--danger); }
+    .result-box {
+      margin-top: 16px; padding: 14px; background: #f1f5f9; border-radius: 8px;
+      border: 1px dashed var(--border); display: none;
+    }
+    .result-box.show { display: block; }
+    .short-link { font-size: 16px; color: var(--primary); font-weight: 600; word-break: break-all; }
+    .muted { color: var(--muted); font-size: 13px; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--border); }
+    th { color: var(--muted); font-weight: 500; background: #f8fafc; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; font-weight: 500; }
+    .badge.ok    { background: #d1fae5; color: #065f46; }
+    .badge.off   { background: #fee2e2; color: #991b1b; }
+    .badge.warn  { background: #fef3c7; color: #92400e; }
+    .tabs { display: flex; gap: 8px; border-bottom: 1px solid var(--border); margin-bottom: 20px; flex-wrap: wrap; }
+    .tab { padding: 10px 14px; border-bottom: 2px solid transparent; color: var(--muted); cursor: pointer; font-size: 14px; }
+    .tab.active { color: var(--primary); border-color: var(--primary); font-weight: 600; }
+    .panel { display: none; }
+    .panel.active { display: block; }
+    .kv { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
+    .kv div { background: #f8fafc; padding: 12px; border-radius: 8px; border: 1px solid var(--border); }
+    .kv .k { font-size: 12px; color: var(--muted); }
+    .kv .v { font-size: 20px; font-weight: 600; margin-top: 4px; }
+    .toast { position: fixed; top: 20px; right: 20px; padding: 12px 16px; border-radius: 8px; color: #fff; font-size: 14px; z-index: 999; opacity: 0; transition: opacity .2s; pointer-events: none; }
+    .toast.show { opacity: 1; }
+    .toast.success { background: var(--success); }
+    .toast.error   { background: var(--danger); }
+    .empty { color: var(--muted); text-align: center; padding: 30px; }
+    details { margin-top: 10px; }
+    summary { cursor: pointer; color: var(--primary); font-size: 13px; }
+    .bar { height: 10px; background: #e2e8f0; border-radius: 999px; overflow: hidden; }
+    .bar > span { display: block; height: 100%; background: linear-gradient(90deg, #4f46e5, #7c3aed); }
+    a { color: var(--primary); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="wrap">
+      <h1>🔗 SHURL 短链接服务</h1>
+      <p>自定义短码 · 有效期 · 访问次数 · PV/UV 统计 · 设备与来源分析</p>
+    </div>
+  </header>
+  <main>
+    <div class="card">
+      <div class="tabs">
+        <div class="tab active" data-tab="create">创建短链接</div>
+        <div class="tab" data-tab="manage">管理</div>
+        <div class="tab" data-tab="stats">统计</div>
+        <div class="tab" data-tab="health">健康状态</div>
+      </div>
+
+      <!-- 创建 -->
+      <section class="panel active" id="panel-create">
+        <div class="row cols-3">
+          <div>
+            <label>原始 URL *</label>
+            <input type="text" id="raw" placeholder="https://example.com/very/long/url" />
+          </div>
+          <div>
+            <label>自定义短码 (可选)</label>
+            <input type="text" id="code" placeholder="留空自动生成" />
+          </div>
+          <div>
+            <label>最大访问次数</label>
+            <input type="number" id="max" placeholder="0 = 不限制" min="0" />
+          </div>
+        </div>
+        <div class="row cols-2" style="margin-top: 12px;">
+          <div>
+            <label>有效期 (秒)，0 = 不限制</label>
+            <input type="number" id="ttl" placeholder="例如 3600 = 1 小时" min="0" />
+          </div>
+          <div>
+            <label>备注</label>
+            <input type="text" id="remark" placeholder="可选" />
+          </div>
+        </div>
+        <div style="margin-top: 16px;">
+          <button class="btn" id="btn-create">生成短链接</button>
+        </div>
+        <div class="result-box" id="create-result">
+          <div class="muted">短链接已生成：</div>
+          <div class="short-link" id="short-link"></div>
+          <div class="muted" id="short-meta" style="margin-top:6px;"></div>
+          <button class="btn secondary" id="btn-copy" style="margin-top:10px;">复制链接</button>
+        </div>
+      </section>
+
+      <!-- 管理 -->
+      <section class="panel" id="panel-manage">
+        <div class="row cols-3">
+          <div>
+            <label>短码</label>
+            <input type="text" id="m-code" placeholder="例如 abc1234" />
+          </div>
+          <div>
+            <label>&nbsp;</label>
+            <button class="btn secondary" id="btn-m-get">查询</button>
+            <button class="btn danger" id="btn-m-del">删除</button>
+            <button class="btn secondary" id="btn-m-disable" style="background:#f59e0b;color:#fff;">禁用</button>
+          </div>
+          <div></div>
+        </div>
+        <div id="manage-result" style="margin-top: 16px;"></div>
+      </section>
+
+      <!-- 统计 -->
+      <section class="panel" id="panel-stats">
+        <div class="row cols-2">
+          <div>
+            <label>短码</label>
+            <input type="text" id="s-code" placeholder="输入短码" />
+          </div>
+          <div>
+            <label>回溯天数</label>
+            <input type="number" id="s-days" value="7" min="1" max="90" />
+          </div>
+        </div>
+        <div style="margin-top: 12px;">
+          <button class="btn" id="btn-stats">获取统计</button>
+        </div>
+        <div id="stats-result" style="margin-top: 16px;"></div>
+      </section>
+
+      <!-- 健康 -->
+      <section class="panel" id="panel-health">
+        <button class="btn" id="btn-health">刷新健康状态</button>
+        <div id="health-result" style="margin-top: 16px;"></div>
+      </section>
+    </div>
+  </main>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+  const API = location.origin + "/api";
+  function toast(msg, type) {
+    const t = document.getElementById("toast");
+    t.textContent = msg;
+    t.className = "toast show " + (type || "success");
+    setTimeout(() => t.classList.remove("show"), 2000);
+  }
+  async function req(method, url, body) {
+    const opts = { method, headers: { "Content-Type": "application/json" } };
+    if (body) opts.body = JSON.stringify(body);
+    const res = await fetch(url, opts);
+    let data; try { data = await res.json(); } catch(e) { data = null; }
+    if (!res.ok || (data && data.code && data.code !== 0)) {
+      const msg = (data && data.message) || ("HTTP " + res.status);
+      const err = new Error(msg);
+      err.data = data; err.status = res.status;
+      throw err;
+    }
+    return data;
+  }
+  // Tabs
+  document.querySelectorAll(".tab").forEach(tab => {
+    tab.addEventListener("click", () => {
+      document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+      document.querySelectorAll(".panel").forEach(p => p.classList.remove("active"));
+      tab.classList.add("active");
+      document.getElementById("panel-" + tab.dataset.tab).classList.add("active");
+    });
+  });
+  // Create
+  document.getElementById("btn-create").addEventListener("click", async () => {
+    const body = {
+      raw_url: document.getElementById("raw").value.trim(),
+      custom_code: document.getElementById("code").value.trim(),
+      max_visits: parseInt(document.getElementById("max").value) || 0,
+      ttl_seconds: parseInt(document.getElementById("ttl").value) || 0,
+      remark: document.getElementById("remark").value
+    };
+    if (!body.raw_url) { toast("请填写原始 URL", "error"); return; }
+    try {
+      const r = await req("POST", API + "/urls", body);
+      const d = r.data;
+      const box = document.getElementById("create-result");
+      const link = location.origin + "/" + d.code;
+      document.getElementById("short-link").textContent = link;
+      document.getElementById("short-link").onclick = () => window.open(link, "_blank");
+      document.getElementById("short-meta").textContent =
+        "创建于 " + new Date(d.created_at).toLocaleString() +
+        (d.expire_at ? "，过期：" + new Date(d.expire_at).toLocaleString() : "，永久有效") +
+        (d.max_visits > 0 ? "，最大 " + d.max_visits + " 次" : "");
+      box.classList.add("show");
+      toast("创建成功");
+    } catch (e) { toast(e.message, "error"); }
+  });
+  document.getElementById("btn-copy").addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(document.getElementById("short-link").textContent);
+      toast("已复制到剪贴板");
+    } catch (e) { toast("复制失败", "error"); }
+  });
+  // Manage
+  document.getElementById("btn-m-get").addEventListener("click", async () => {
+    const code = document.getElementById("m-code").value.trim();
+    if (!code) return;
+    try {
+      const r = await req("GET", API + "/urls/" + code);
+      const d = r.data;
+      const statusBadge = d.disabled ? '<span class="badge off">已禁用</span>'
+                      : d.is_expired ? '<span class="badge warn">已过期</span>'
+                      : '<span class="badge ok">正常</span>';
+      document.getElementById("manage-result").innerHTML = `
+        <table><thead><tr><th>短码</th><th>原始 URL</th><th>访问次数</th><th>状态</th><th>创建时间</th><th>过期时间</th><th>备注</th></tr></thead>
+        <tbody><tr>
+          <td>${d.code}</td>
+          <td style="max-width:360px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${d.raw_url}">${d.raw_url}</td>
+          <td>${d.visits}${d.max_visits > 0 ? " / " + d.max_visits : ""}</td>
+          <td>${statusBadge}</td>
+          <td>${new Date(d.created_at).toLocaleString()}</td>
+          <td>${d.expire_at ? new Date(d.expire_at).toLocaleString() : "-"}</td>
+          <td>${d.remark || "-"}</td>
+        </tr></tbody></table>`;
+    } catch (e) { toast(e.message, "error"); }
+  });
+  document.getElementById("btn-m-del").addEventListener("click", async () => {
+    const code = document.getElementById("m-code").value.trim();
+    if (!code || !confirm("确认删除短码 " + code + "？")) return;
+    try {
+      await req("DELETE", API + "/urls/" + code);
+      toast("已删除");
+      document.getElementById("manage-result").innerHTML = "";
+    } catch (e) { toast(e.message, "error"); }
+  });
+  document.getElementById("btn-m-disable").addEventListener("click", async () => {
+    const code = document.getElementById("m-code").value.trim();
+    if (!code || !confirm("确认禁用短码 " + code + "？")) return;
+    try {
+      await req("PATCH", API + "/urls/" + code, { disabled: true });
+      toast("已禁用");
+    } catch (e) { toast(e.message, "error"); }
+  });
+  // Stats
+  document.getElementById("btn-stats").addEventListener("click", async () => {
+    const code = document.getElementById("s-code").value.trim();
+    const days = parseInt(document.getElementById("s-days").value) || 7;
+    if (!code) return;
+    try {
+      const r = await req("GET", API + "/stats/" + code + "?days=" + days);
+      const d = r.data;
+      const total = Math.max(1, d.total_pv);
+      const bars = (name, arr, fn) => {
+        if (!arr || !arr.length) return `<div class="empty">暂无 ${name} 数据</div>`;
+        return arr.map(x => {
+          const cnt = fn(x); const pct = (cnt*100/total).toFixed(1);
+          return `<div style="margin:6px 0;"><div style="display:flex;justify-content:space-between;font-size:13px;"><span>${x[name.toLowerCase()]||x.browser||x.os||x.device}</span><span>${cnt} (${pct}%)</span></div><div class="bar"><span style="width:${pct}%"></span></div></div>`;
+        }).join("");
+      };
+      const dailyRows = (d.daily||[]).map(day => `<tr><td>${day.date}</td><td>${day.pv}</td><td>${day.uv}</td><td>${day.redirect}</td><td>${day.expired}</td><td>${day.not_found}</td></tr>`).join("") || `<tr><td colspan="6" class="empty">暂无每日数据</td></tr>`;
+      document.getElementById("stats-result").innerHTML = `
+        <div class="kv">
+          <div><div class="k">总 PV</div><div class="v">${d.total_pv}</div></div>
+          <div><div class="k">总 UV</div><div class="v">${d.total_uv}</div></div>
+          <div><div class="k">样本数</div><div class="v">${d.sample_size}</div></div>
+          <div><div class="k">生成于</div><div class="v" style="font-size:14px;">${new Date(d.generated_at).toLocaleString()}</div></div>
+        </div>
+        <h3 style="margin-top:20px;">每日 PV/UV</h3>
+        <table><thead><tr><th>日期</th><th>PV</th><th>UV</th><th>重定向(302)</th><th>过期(410)</th><th>未找到(404)</th></tr></thead><tbody>${dailyRows}</tbody></table>
+        <h3 style="margin-top:20px;">来源分布 (Top 10)</h3>${bars("Domain", d.sources, x=>x.count)}
+        <h3 style="margin-top:20px;">设备分布</h3>${bars("Device", d.devices, x=>x.count)}
+        <h3 style="margin-top:20px;">浏览器分布 (Top 10)</h3>${bars("Browser", d.browsers, x=>x.count)}
+        <h3 style="margin-top:20px;">操作系统分布 (Top 10)</h3>${bars("OS", d.systems, x=>x.count)}
+      `;
+    } catch (e) { toast(e.message, "error"); }
+  });
+  // Health
+  function renderHealth() {
+    fetch(location.origin + "/health").then(r => r.json()).then(r => {
+      const d = r.data || r;
+      const badge = d.status === "up" ? '<span class="badge ok">UP</span>'
+                 : d.status === "degraded" ? '<span class="badge warn">DEGRADED</span>'
+                 : '<span class="badge off">DOWN</span>';
+      document.getElementById("health-result").innerHTML = `
+        <div style="margin-bottom:12px;">总体状态：${badge}</div>
+        <table>
+          <tr><th>URL 存储</th><td>${d.url_store_ready ? '<span class="badge ok">就绪</span>' : '<span class="badge off">未就绪</span>'}</td>
+              <th>日志存储</th><td>${d.log_store_ready ? '<span class="badge ok">就绪</span>' : '<span class="badge off">未就绪</span>'}</td></tr>
+          <tr><th>短码总数</th><td>${d.url_total}</td><th>可用数</th><td>${d.url_active}</td></tr>
+          <tr><th>已禁用</th><td>${d.url_disabled}</td><th>已过期</th><td>${d.url_expired}</td></tr>
+        </table>
+      `;
+    }).catch(e => toast("健康检查失败", "error"));
+  }
+  document.getElementById("btn-health").addEventListener("click", renderHealth);
+  renderHealth();
+  </script>
+</body>
+</html>

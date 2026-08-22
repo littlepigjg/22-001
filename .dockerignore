@@ -1,0 +1,57 @@
+# 二进制 / 产物
+/server
+/shurl
+*.exe
+*.out
+*.test
+*.prof
+*.pprof
+coverage.out
+coverage.html
+
+# Git
+.git
+.gitignore
+.github
+.claudeignore
+
+# Go 模块缓存
+vendor/
+
+# 构建临时目录
+dist/
+build/
+tmp/
+temp/
+
+# 本地数据文件（运行时生成的 JSON 持久化）
+data/
+*.jsonl
+*.ndjson
+*.log
+data/**/*.json
+data/**/*.log
+
+# Node（如果存在）
+node_modules/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# 文档与交付提示（容器里不需要，若需要可手动移除）
+提示词*.txt
+验收*.txt
+doker.txt
+zhiling.txt
+empty.sh
+branch.sh
+commit.sh
+
+# Docker 构建产物（避免循环）
+*.tar
+*.tar.gz
