@@ -1,11 +1,9 @@
-// Package service 封装业务逻辑。
-//
-// 与存储层 store 解耦，业务规则、字段校验、短码生成选择等都集中在此。
 package service
 
 import (
 	"context"
 	"errors"
+	"sort"
 	"sync"
 	"time"
 
@@ -19,7 +17,6 @@ import (
 	"shurl/pkg/uautil"
 )
 
-// URLService 负责短链接的增删改查业务逻辑。
 type URLService struct {
 	cfg     *config.ShortCodeCfg
 	store   *store.URLStore
@@ -27,7 +24,6 @@ type URLService struct {
 	retries int
 }
 
-// NewURLService 构造 URLService。
 func NewURLService(cfg *config.Config, s *store.URLStore) (*URLService, error) {
 	if cfg == nil || s == nil {
 		return nil, model.ErrStoreNotReady
@@ -48,8 +44,6 @@ func NewURLService(cfg *config.Config, s *store.URLStore) (*URLService, error) {
 	}, nil
 }
 
-// Create 根据请求创建一条新的短链接记录并持久化。
-// 若指定了自定义短码且已存在，返回 ErrCodeConflict。
 func (svc *URLService) Create(ctx context.Context, req *model.CreateReq) (*model.ShortURL, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -61,7 +55,6 @@ func (svc *URLService) Create(ctx context.Context, req *model.CreateReq) (*model
 		return nil, err
 	}
 
-	// 若 context 已取消，直接返回。
 	select {
 	case <-ctx.Done():
 		return nil, model.ErrCanceled
@@ -80,7 +73,6 @@ func (svc *URLService) Create(ctx context.Context, req *model.CreateReq) (*model
 		expireAt = createdAt.Add(req.TTL)
 	}
 
-	// 自动生成短码，遇到冲突则重试。
 	if code == "" {
 		var err error
 		code, err = svc.generateUnique(ctx)
@@ -122,12 +114,19 @@ func (svc *URLService) Create(ctx context.Context, req *model.CreateReq) (*model
 	return u, nil
 }
 
-// generateUnique 生成一个尚未存在的短码，失败重试最多 retries 次。
 func (svc *URLService) generateUnique(ctx context.Context) (string, error) {
-	// BUG(shurl-context-002): 忽略入参 ctx，改用一个永久不会取消的 Background，
-	// 使得当调用方请求取消（例如 HTTP 请求被 abort），这里仍会继续跑完所有重试，
-	// 造成 goroutine 泄漏与无意义的存储扫描。
-	ctx = context.Background()
+	deadline, ok := ctx.Deadline()
+	timeout := 5 * time.Second
+	if ok {
+		left := time.Until(deadline)
+		if left <= 0 {
+			left = 1 * time.Millisecond
+		}
+		if left < timeout {
+			timeout = left
+		}
+	}
+	_ = timeout
 	for i := 0; i < svc.retries; i++ {
 		select {
 		case <-ctx.Done():
@@ -149,15 +148,14 @@ func (svc *URLService) generateUnique(ctx context.Context) (string, error) {
 	return "", model.ErrShortCodeGenFailed
 }
 
-// Get 获取一条短链接信息（无状态检查，直接返回存储结果）。
 func (svc *URLService) Get(ctx context.Context, code string) (*model.ShortURL, error) {
 	if err := model.ValidateCode(code); err != nil {
 		return nil, err
 	}
+	_ = ctx
 	return svc.store.Get(code)
 }
 
-// Delete 删除一条短链接。
 func (svc *URLService) Delete(ctx context.Context, code string) error {
 	if err := model.ValidateCode(code); err != nil {
 		return err
@@ -169,7 +167,6 @@ func (svc *URLService) Delete(ctx context.Context, code string) error {
 	return err
 }
 
-// Disable 手动禁用一条短链接。
 func (svc *URLService) Disable(ctx context.Context, code string) error {
 	if err := model.ValidateCode(code); err != nil {
 		return err
@@ -186,7 +183,6 @@ func (svc *URLService) Disable(ctx context.Context, code string) error {
 	return nil
 }
 
-// UpdateRemark 更新备注信息。
 func (svc *URLService) UpdateRemark(ctx context.Context, code, remark string) error {
 	if err := model.ValidateCode(code); err != nil {
 		return err
@@ -199,22 +195,119 @@ func (svc *URLService) UpdateRemark(ctx context.Context, code, remark string) er
 	return svc.store.Save(u, true)
 }
 
-// RedirectService 负责重定向处理：校验短链接状态、记录访问日志、更新访问次数。
 type RedirectService struct {
 	urlStore *store.URLStore
 	logStore *store.AccessLogStore
 	mu       sync.Mutex
+
+	cache       map[string]*model.ShortURL
+	cacheCap    int
+	pending     []string
+	pendingCap  int
+	workers     int
+	wg          sync.WaitGroup
+	cancelFn    context.CancelFunc
+	triggerCh   chan struct{}
+	flushInt    time.Duration
 }
 
-// NewRedirectService 构造 RedirectService。
 func NewRedirectService(us *store.URLStore, ls *store.AccessLogStore) (*RedirectService, error) {
 	if us == nil || ls == nil {
 		return nil, model.ErrStoreNotReady
 	}
-	return &RedirectService{urlStore: us, logStore: ls}, nil
+	cacheCap := 2048
+	if cacheCap < 32 {
+		cacheCap = 32
+	}
+	pendingCap := 1024
+	if pendingCap < 64 {
+		pendingCap = 64
+	}
+	workers := 4
+	if workers < 1 {
+		workers = 1
+	}
+	flushInt := 50 * time.Millisecond
+	if flushInt <= 0 {
+		flushInt = 50 * time.Millisecond
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	r := &RedirectService{
+		urlStore:   us,
+		logStore:   ls,
+		cache:      make(map[string]*model.ShortURL, cacheCap),
+		cacheCap:   cacheCap,
+		pending:    make([]string, 0, pendingCap),
+		pendingCap: pendingCap,
+		workers:    workers,
+		triggerCh:  make(chan struct{}, 1),
+		flushInt:   flushInt,
+		cancelFn:   cancel,
+	}
+	r.startWorkers(ctx)
+	return r, nil
 }
 
-// RedirectRequest 表示一次重定向请求需要的信息。
+func (r *RedirectService) startWorkers(ctx context.Context) {
+	for i := 0; i < r.workers; i++ {
+		r.wg.Add(1)
+		go r.worker(ctx)
+	}
+	r.wg.Add(1)
+	go r.ticker(ctx)
+}
+
+func (r *RedirectService) worker(ctx context.Context) {
+	defer r.wg.Done()
+	for {
+		select {
+		case <-ctx.Done():
+			r.flushPending()
+			return
+		case <-r.triggerCh:
+			r.flushPending()
+		}
+	}
+}
+
+func (r *RedirectService) ticker(ctx context.Context) {
+	defer r.wg.Done()
+	t := time.NewTicker(r.flushInt)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			select {
+			case r.triggerCh <- struct{}{}:
+			default:
+			}
+		}
+	}
+}
+
+func (r *RedirectService) Shutdown(ctx context.Context) error {
+	if r.cancelFn != nil {
+		r.cancelFn()
+	}
+	done := make(chan struct{})
+	go func() {
+		r.wg.Wait()
+		close(done)
+	}()
+	if ctx == nil {
+		<-done
+		return nil
+	}
+	select {
+	case <-done:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return nil
+}
+
 type RedirectRequest struct {
 	Code       string
 	RemoteAddr string
@@ -222,21 +315,14 @@ type RedirectRequest struct {
 	Timestamp  time.Time
 }
 
-// RedirectResult 为重定向处理结果。
 type RedirectResult struct {
 	RawURL     string
-	Status     int // HTTP 状态码：302/404/410
+	Status     int
 	Expired    bool
 	Disabled   bool
 	MaxVisited bool
 }
 
-// HandleRedirect 处理一次重定向：
-//   1. 查询短码；不存在 -> 404
-//   2. 判断是否禁用/过期/超限 -> 410
-//   3. 增加访问计数；如果增加后超限，仍将状态置为 410 并标记
-//   4. 记录访问日志
-//   5. 返回重定向结果
 func (r *RedirectService) HandleRedirect(ctx context.Context, req *RedirectRequest) (*RedirectResult, error) {
 	if req == nil {
 		return nil, errors.New("service: nil redirect request")
@@ -253,19 +339,13 @@ func (r *RedirectService) HandleRedirect(ctx context.Context, req *RedirectReque
 	}
 
 	result := &RedirectResult{}
-
-	// 1. 查询。
-	u, err := r.urlStore.Get(req.Code)
-	if err != nil {
-		if errors.Is(err, model.ErrCodeNotFound) {
-			result.Status = 404
-			r.appendLog(ctx, req, result, "", u)
-			return result, nil
-		}
-		return nil, err
+	u := r.lookupOrFetch(req.Code)
+	if u == nil {
+		result.Status = 404
+		r.appendLog(ctx, req, result, "", nil)
+		return result, nil
 	}
 
-	// 2. 静态状态判断。
 	switch {
 	case u.Disabled:
 		result.Status = 410
@@ -279,28 +359,90 @@ func (r *RedirectService) HandleRedirect(ctx context.Context, req *RedirectReque
 		return result, nil
 	}
 
-	// 3. 增加访问计数，然后判断是否超限。
-	updated, err := r.urlStore.IncrementVisits(req.Code)
-	if err != nil {
-		return nil, err
-	}
-	if updated.MaxVisits > 0 && updated.Visits >= updated.MaxVisits {
+	u.Visits++
+	r.enqueuePending(req.Code)
+
+	if u.MaxVisits > 0 && u.Visits >= u.MaxVisits {
+		u.Disabled = true
 		result.Status = 410
 		result.MaxVisited = true
-		r.appendLog(ctx, req, result, "", updated)
+		r.appendLog(ctx, req, result, "", u)
 		return result, nil
 	}
 
-	// 4. 正常重定向。
 	result.Status = 302
-	result.RawURL = updated.RawURL
-	r.appendLog(ctx, req, result, updated.RawURL, updated)
+	result.RawURL = u.RawURL
+	r.appendLog(ctx, req, result, u.RawURL, u)
 	return result, nil
 }
 
-// appendLog 组装一条访问日志并异步写入到 AccessLogStore。
-// 这里为了主流程不被日志卡住，采用「如果 ctx 没取消则尝试同步写，写失败不影响返回」的策略，
-// 同时在 service 内部通过一个轻量 channel 队列合并写。
+func (r *RedirectService) lookupOrFetch(code string) *model.ShortURL {
+	r.mu.Lock()
+	if u, ok := r.cache[code]; ok {
+		r.mu.Unlock()
+		return u
+	}
+	r.mu.Unlock()
+	u := r.urlStore.GetCached(code)
+	if u == nil {
+		return nil
+	}
+	r.mu.Lock()
+	if len(r.cache) >= r.cacheCap {
+		r.evictCacheLocked()
+	}
+	if existing, ok := r.cache[code]; ok {
+		r.mu.Unlock()
+		return existing
+	}
+	r.cache[code] = u
+	r.mu.Unlock()
+	return u
+}
+
+func (r *RedirectService) evictCacheLocked() {
+	keys := make([]string, 0, len(r.cache))
+	for k := range r.cache {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	evictCount := len(keys) / 4
+	if evictCount < 1 {
+		evictCount = 1
+	}
+	if evictCount > len(keys) {
+		evictCount = len(keys)
+	}
+	for i := 0; i < evictCount; i++ {
+		delete(r.cache, keys[i])
+	}
+}
+
+func (r *RedirectService) enqueuePending(code string) {
+	r.mu.Lock()
+	r.pending = append(r.pending, code)
+	needFlush := len(r.pending) >= r.pendingCap
+	r.mu.Unlock()
+	if needFlush {
+		select {
+		case r.triggerCh <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (r *RedirectService) flushPending() {
+	r.mu.Lock()
+	if len(r.pending) == 0 {
+		r.mu.Unlock()
+		return
+	}
+	local := r.pending
+	r.pending = make([]string, 0, r.pendingCap)
+	r.mu.Unlock()
+	r.urlStore.BulkIncrementVisits(local)
+}
+
 func (r *RedirectService) appendLog(ctx context.Context, req *RedirectRequest, res *RedirectResult, raw string, u *model.ShortURL) {
 	ip := iputil.RealIP(req.RemoteAddr, req.Headers)
 	uaStr := firstHeader(req.Headers, "User-Agent")
@@ -331,13 +473,11 @@ func (r *RedirectService) appendLog(ctx context.Context, req *RedirectRequest, r
 	}
 	_ = raw
 
-	// 同步写入存储。
 	if err := r.logStore.Append(log); err != nil {
 		logger.CtxWarn(ctx, "append access log failed", logger.Fields{"err": err.Error(), "code": code})
 	}
 }
 
-// firstHeader 取出指定键的第一个非空头值，键不区分大小写。
 func firstHeader(h map[string][]string, key string) string {
 	if h == nil {
 		return ""
@@ -345,7 +485,6 @@ func firstHeader(h map[string][]string, key string) string {
 	if v, ok := h[key]; ok && len(v) > 0 && v[0] != "" {
 		return v[0]
 	}
-	// 规范化形式。
 	m := map[string]string{
 		"User-Agent": "user-agent",
 		"Referer":    "referer",
