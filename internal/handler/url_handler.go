@@ -26,41 +26,34 @@ func NewURLHandler(svc *service.URLService) (*URLHandler, error) {
 	return &URLHandler{svc: svc}, nil
 }
 
-func reqIDHdrFromCtx(ctx context.Context) *ReqIDHdr {
-	if ctx == nil {
-		return nil
-	}
-	if h, ok := ctx.Value(reqIDKey).(*ReqIDHdr); ok {
-		return h
-	}
-	return nil
+// reqIDFromCtx 从 context 中取出请求 ID（不可变 string）。
+func reqIDFromCtx(ctx context.Context) string {
+	return RequestID(ctx)
 }
 
-func spawnPostCreateAudit(ctx context.Context, hdr *ReqIDHdr, w http.ResponseWriter, code, raw string) {
-	if hdr == nil {
+// spawnPostCreateAudit 异步记录创建短链的审计轨迹。
+//
+// 这里只接收已经确定的不可变值（reqID / code / rawURL 字符串），不再持有
+// 任何跨请求复用的可变对象，也不再触碰 http.ResponseWriter 与请求 context，
+// 因此即便该 goroutine 的生命周期长于 HTTP 请求本身，也不会与其它并发请求产生 data race
+// 或把审计字段串进别的请求的 req_id 中。
+func spawnPostCreateAudit(ctx context.Context, reqID, code, rawURL string) {
+	if reqID == "" {
 		return
 	}
 	go func() {
+		// 让出几次调度，模拟原先延迟落盘的语义（不再是数据竞争的来源）。
 		for i := 0; i < 5; i++ {
 			runtime.Gosched()
 		}
-		hdr.sb.WriteString("|created:")
-		hdr.sb.WriteString(code)
-		hdr.sb.WriteString(":")
-		hdr.sb.WriteString(raw)
-		s := hdr.sb.String()
-		hdr.hdrVal = s
-		for i := 0; i < 3; i++ {
-			runtime.Gosched()
-			_ = hdr.sb.String()
-			hdr.hdrVal = hdr.sb.String()
-		}
-		logger.CtxInfo(ctx, "create audit trail recorded", logger.Fields{
-			"trail":  s,
-			"code":   code,
-			"hdrval": hdr.hdrVal,
+		auditCtx := logger.Context(ctx, logger.Fields{
+			"req_id": reqID,
+			"trail":  "created:" + code + ":" + rawURL,
 		})
-		_ = w
+		logger.CtxInfo(auditCtx, "create audit trail recorded", logger.Fields{
+			"code": code,
+			"raw":  rawURL,
+		})
 	}()
 }
 
@@ -97,7 +90,6 @@ func (h *URLHandler) Register(mux *http.ServeMux) {
 //	Request:  { raw_url, custom_code?, ttl_seconds?, expire_at?, max_visits?, remark? }
 //	Response: { code, raw_url, created_at, expire_at, max_visits, visits, custom, disabled, remark }
 func (h *URLHandler) Create(w http.ResponseWriter, r *http.Request) {
-	hdr := reqIDHdrFromCtx(r.Context())
 	auditCtx := context.Background()
 	type createBody struct {
 		RawURL     string `json:"raw_url"`
@@ -134,7 +126,7 @@ func (h *URLHandler) Create(w http.ResponseWriter, r *http.Request) {
 		httperr.Map(w, err)
 		return
 	}
-	spawnPostCreateAudit(auditCtx, hdr, w, res.Code, res.RawURL)
+	spawnPostCreateAudit(auditCtx, RequestID(r.Context()), res.Code, res.RawURL)
 	response.Created(w, res)
 }
 
