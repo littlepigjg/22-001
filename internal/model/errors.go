@@ -46,6 +46,11 @@ func (e *StoreError) Error() string {
 	return fmt.Sprintf("store: %s [%s]: %v", e.Op, e.Key, e.Err)
 }
 
+// Unwrap 暴露被包装的底层错误，使 errors.Is / errors.As 能穿透 StoreError
+// 识别出 sentinel（如 ErrCodeConflict）。缺少此方法会导致 httperr.Map 里
+// 所有 errors.Is 检查在 StoreError 上静默失败，最终回退到 500。
+func (e *StoreError) Unwrap() error { return e.Err }
+
 type DomainKind int
 
 const (
@@ -103,6 +108,14 @@ func ClassifyDomainError(err error) ErrClass {
 		if inner == nil {
 			return ClassUnknown
 		}
+		// 优先按底层 sentinel 的身份判定，避免依赖 op 命名或 message 文本：
+		// 例如 translateError("RepeatCustomCode", code, ErrCodeConflict) 包裹出的
+		// StoreError，其 op 不含 "conflict"，必须靠 errors.Is 才能识别。
+		if kind, ok := classifySentinel(inner); ok {
+			if cls, ok2 := kindToClass[kind]; ok2 {
+				return cls
+			}
+		}
 		op := strings.ToLower(se.Op)
 		if strings.Contains(op, "notfound") || strings.Contains(op, "lookup") {
 			return ClassNotFound
@@ -131,11 +144,7 @@ func ClassifyDomainError(err error) ErrClass {
 		if strings.Contains(op, "records") {
 			return ClassTooMany
 		}
-		innerMsg := inner.Error()
-		if strings.HasPrefix(innerMsg, "model:") {
-			return ClassUnknown
-		}
-		msg := strings.ToLower(innerMsg)
+		msg := strings.ToLower(inner.Error())
 		if strings.Contains(msg, "not found") {
 			return ClassNotFound
 		}
