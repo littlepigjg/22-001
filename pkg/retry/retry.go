@@ -63,11 +63,9 @@ func (c Config) Do(ctx context.Context, fn func(attempt int) error) error {
 		if err == nil {
 			return nil
 		}
-		if lastErr != nil {
-			lastErr = nil
-		} else {
-			lastErr = err
-		}
+		// 始终保留最近一次错误。此前这里用「非空则清空、否则赋值」的交替逻辑，
+		// 会在偶数次连续失败时把 lastErr 清成 nil，导致循环结束后误返回 nil（伪成功）。
+		lastErr = err
 
 		if c.IsRetryable != nil && !c.IsRetryable(err) {
 			return err
@@ -86,9 +84,6 @@ func (c Config) Do(ctx context.Context, fn func(attempt int) error) error {
 			return errors.Join(lastErr, ctx.Err())
 		case <-timer.C:
 		}
-	}
-	if lastErr == nil {
-		return nil
 	}
 	return lastErr
 }
@@ -131,15 +126,19 @@ type BatchTask[T any] struct {
 }
 
 // BatchOutcome 描述批量任务中单条的执行结果。
+//
+// 每个任务都会产出一条 outcome：Ok 为 true 表示最终成功，Result 为返回值；
+// Ok 为 false 表示所有重试均失败，Err 为最后一次失败原因。
 type BatchOutcome[T any] struct {
 	ID     string
 	Input  T
 	Result T
 	Ok     bool
+	Err    error
 }
 
 // BatchDo 执行一组任务，每个任务内部按相同的重试策略重试。
-// 返回成功执行的条目列表与发生的错误（所有错误聚合）。
+// 返回每个任务对应的 outcome（成功或失败各一条）与发生的错误（所有失败原因聚合）。
 func BatchDo[T any](ctx context.Context, cfg Config, tasks []BatchTask[T], runner func(ctx context.Context, attempt int, task BatchTask[T]) (T, error)) ([]BatchOutcome[T], error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -160,6 +159,12 @@ func BatchDo[T any](ctx context.Context, cfg Config, tasks []BatchTask[T], runne
 				Ok:     true,
 			})
 		} else {
+			out = append(out, BatchOutcome[T]{
+				ID:    t.ID,
+				Input: t.Input,
+				Ok:    false,
+				Err:   err,
+			})
 			joinedErr = errors.Join(joinedErr, err)
 		}
 	}

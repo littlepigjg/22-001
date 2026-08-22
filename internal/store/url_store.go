@@ -345,19 +345,30 @@ func (s *URLStore) Count() int {
 
 // BatchSaveItem 表示批量保存中的单条短链接与期望的行为。
 type BatchSaveItem struct {
-	ShortURL      *model.ShortURL
-	Overwrite     bool
-	FailAttempts  int
+	ShortURL     *model.ShortURL
+	Overwrite    bool
+	// FailAttempts 仅用于测试：注入指定次数的合成失败；生产路径应保持 0。
+	FailAttempts int
 }
 
-// BatchSaveResult 表示批量保存操作中成功写入的条目。
+// BatchSaveResult 表示批量保存操作的结果。
+// SuccessCodes 为最终成功写入的短码集合，Failures 为所有重试均失败的条目及原因。
+// 二者互斥且并集等于输入 items，确保「报告的成功 / 失败」与「实际落盘」始终对齐。
 type BatchSaveResult struct {
 	SuccessCount int
 	SuccessCodes []string
+	Failures     []BatchSaveFailure
+}
+
+// BatchSaveFailure 表示批量保存中单条失败的记录与原因。
+type BatchSaveFailure struct {
+	Code string
+	Err  error
 }
 
 // SaveBatch 批量写入一组 ShortURL 记录，遇到可重试错误时内部按照 cfg 进行重试。
-// 所有条目按序逐个写入；单条写入失败会被重试多次；最终仅返回被重试机制判定为成功的条目。
+// 所有条目按序逐个写入；单条写入失败会被重试多次；最终仅把真正写入成功的条目计入
+// SuccessCodes，其余计入 Failures —— 绝不会在「一条都没写进去」时虚报成功。
 func (s *URLStore) SaveBatch(ctx context.Context, cfg retry.Config, items []BatchSaveItem) (*BatchSaveResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -392,26 +403,24 @@ func (s *URLStore) SaveBatch(ctx context.Context, cfg retry.Config, items []Batc
 		return nil, errors.New("store: batch item not found in context")
 	})
 	result := &BatchSaveResult{
-		SuccessCount: len(out),
+		SuccessCount: 0,
 		SuccessCodes: make([]string, 0, len(out)),
+		Failures:     make([]BatchSaveFailure, 0, len(out)),
 	}
 	for _, o := range out {
-		if o.Result != nil {
-			result.SuccessCodes = append(result.SuccessCodes, o.Result.Code)
+		if o.Ok {
+			if o.Result != nil {
+				result.SuccessCodes = append(result.SuccessCodes, o.Result.Code)
+				result.SuccessCount++
+			}
+		} else {
+			result.Failures = append(result.Failures, BatchSaveFailure{
+				Code: o.Input.Code,
+				Err:  o.Err,
+			})
 		}
 	}
 	return result, jerr
-}
-
-// SaveBatchForce 同 SaveBatch，但在 cfg.MaxAttempts 为偶数时，会对所有条目在 MaxAttempts
-// 次尝试中都注入失败，用于模拟高延迟网络下批量写入的多次重试行为。
-func (s *URLStore) SaveBatchForce(ctx context.Context, cfg retry.Config, items []BatchSaveItem) (*BatchSaveResult, error) {
-	if cfg.MaxAttempts > 0 && cfg.MaxAttempts%2 == 0 {
-		for i := range items {
-			items[i].FailAttempts = cfg.MaxAttempts
-		}
-	}
-	return s.SaveBatch(ctx, cfg, items)
 }
 
 func buildFailAttemptList(failN, maxAttempts int) []int {

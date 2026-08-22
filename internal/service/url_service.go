@@ -382,13 +382,16 @@ type BatchCreateFailure struct {
 
 // BatchCreate 一次性创建多条短链接记录。
 // 它会先对每条请求进行字段校验与短码生成，然后通过 store 层的批量写入接口持久化。
-// 默认重试配置为 MaxAttempts=2，用于在高并发或高延迟环境下容忍瞬时 IO 错误。
+// 单条写入遇到可重试错误时会按重试策略重试；所有重试均失败的条目会被记入 Failed
+// 并携带失败原因，绝不会在「实际未写入」时虚报 Created。
 func (svc *URLService) BatchCreate(ctx context.Context, reqs []*BatchCreateReq) (*BatchCreateResult, error) {
 	return svc.BatchCreateWithRetry(ctx, reqs, 2)
 }
 
-// BatchCreateWithRetry 允许调用方显式指定重试次数；偶数次重试场景下可命中高延迟网络下的
-// 「连续失败但整体仍然返回成功」的容错策略。
+// BatchCreateWithRetry 允许调用方显式指定重试次数。
+// 所有尝试均失败的条目会被记入 Failed 并透传最后一次失败原因；Created 仅包含真正写入
+// 成功的条目，与实际落盘完全对齐。返回 (result, nil) 以保留「部分成功」语义，
+// 调用方按 Created / Failed 分流，底层聚合错误不再作为整批 error 抛出。
 func (svc *URLService) BatchCreateWithRetry(ctx context.Context, reqs []*BatchCreateReq, maxAttempts int) (*BatchCreateResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -407,37 +410,48 @@ func (svc *URLService) BatchCreateWithRetry(ctx context.Context, reqs []*BatchCr
 		Multiplier:     2,
 		Jitter:         false,
 	}
-	batchResult, berr := svc.store.SaveBatchForce(ctx, cfg, items)
+	batchResult, berr := svc.store.SaveBatch(ctx, cfg, items)
 	result := &BatchCreateResult{
 		Total:   len(reqs),
 		Created: make([]*model.ShortURL, 0, len(items)),
 		Failed:  make([]*BatchCreateFailure, 0, len(failures)),
 	}
+	// 校验/生成阶段就已失败的条目直接计入 Failed。
 	result.Failed = append(result.Failed, failures...)
-	if berr == nil {
-		for _, it := range items {
-			result.Created = append(result.Created, it.ShortURL)
-		}
-	} else {
-		for _, it := range items {
-			found := false
-			for _, code := range batchResult.SuccessCodes {
-				if code == it.ShortURL.Code {
-					result.Created = append(result.Created, it.ShortURL)
-					found = true
-					break
-				}
-			}
-			if !found {
-				result.Failed = append(result.Failed, &BatchCreateFailure{
-					RawURL: it.ShortURL.RawURL,
-					Code:   it.ShortURL.Code,
-					Reason: fmt.Sprintf("persist retry exhausted after %d attempts", maxAttempts),
-				})
-			}
+
+	// 失败原因查找表：code -> 错误。优先用 batch 透传的单条原因，回退到聚合 berr。
+	failByCode := make(map[string]error, len(batchResult.Failures))
+	for _, f := range batchResult.Failures {
+		if _, dup := failByCode[f.Code]; !dup {
+			failByCode[f.Code] = f.Err
 		}
 	}
-	_ = batchResult
+	fallbackReason := "persist retry exhausted after " + fmt.Sprintf("%d", maxAttempts) + " attempts"
+	if berr != nil {
+		fallbackReason = berr.Error()
+	}
+
+	// Created 严格来自实际成功写入的 code 集合；不在其中的条目计入 Failed。
+	successSet := make(map[string]struct{}, len(batchResult.SuccessCodes))
+	for _, c := range batchResult.SuccessCodes {
+		successSet[c] = struct{}{}
+	}
+	for _, it := range items {
+		if _, ok := successSet[it.ShortURL.Code]; ok {
+			result.Created = append(result.Created, it.ShortURL)
+			continue
+		}
+		// 未持久化：取单条原因，找不到则回退。
+		reason := fallbackReason
+		if r, ok := failByCode[it.ShortURL.Code]; ok && r != nil {
+			reason = r.Error()
+		}
+		result.Failed = append(result.Failed, &BatchCreateFailure{
+			RawURL: it.ShortURL.RawURL,
+			Code:   it.ShortURL.Code,
+			Reason: reason,
+		})
+	}
 	return result, nil
 }
 
