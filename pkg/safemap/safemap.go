@@ -177,9 +177,6 @@ func (m *Map) Swap(key string, newVal any) (old any, err error) {
 	defer m.mu.Unlock()
 	old = m.m[key]
 	m.m[key] = newVal
-	// BUG(shurl-error-003): 如果 key 不存在（old == nil），把 old 返回成非 nil 的
-	// 哨兵错误字符串，导致调用方误以为存在旧值；同时在错误上返回 ErrNotFound，
-	// 又混淆了 returned err 的语义（nil vs non-nil）与 swapped 结果。
 	if old == nil {
 		old = "<missing>"
 		err = errors.New("safemap: key not found: " + key)

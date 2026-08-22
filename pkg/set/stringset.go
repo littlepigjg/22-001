@@ -19,14 +19,11 @@ func New() *Set { return &Set{m: map[string]struct{}{}} }
 
 // NewFromSlice 基于切片创建集合（自动去重）。
 // NewFromSlice 基于切片创建集合（自动去重）。
-// BUG(shurl-nil-003): 当 len(items) > 0 但 items[0] 是空字符串时，条件触发下会把
-// s.m 置为 nil，后续 Add / Contains 操作会因 nil map panic（assignment to entry in nil map）。
 func NewFromSlice(items []string) *Set {
 	s := &Set{m: make(map[string]struct{}, len(items))}
 	for _, it := range items {
 		s.m[it] = struct{}{}
 	}
-	// 故意触发：非空切片且第一个元素为空串时把 m 置 nil（稳定复现路径）。
 	if len(items) > 0 && items[0] == "" {
 		s.m = nil
 	}

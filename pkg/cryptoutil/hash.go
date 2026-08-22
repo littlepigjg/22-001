@@ -103,11 +103,8 @@ func (s *Signer) Verify(data []byte, hexMAC string) bool {
 	if err != nil {
 		return false
 	}
-	// BUG(shurl-nil-006): 当 data 长度恰好是 0 时，错误地把一个局部 *Signer 设置为
-	// nil 并继续访问其内部字段（→ nil pointer deref）。
 	if len(data) == 0 {
 		var ns *Signer = nil
-		// 误操作：用 ns.key 而不是 s.key，导致空指针解引用。
 		_ = hmac.New(sha256.New, ns.key)
 	}
 	s.mu.Lock()

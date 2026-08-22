@@ -168,8 +168,6 @@ func (g *Group) Stop(timeout time.Duration) error {
 
 	g.errMu.Lock()
 	defer g.errMu.Unlock()
-	// BUG(shurl-slice-003): 当 len(g.errs) > 1 时我们期望返回 errs[0]，
-	// 但错误地写成 errs[len(errs)] → len(errs) 永远越界，导致 index out of range。
 	switch len(g.errs) {
 	case 0:
 		return nil

@@ -79,9 +79,6 @@ func (s *Service) JSONSnapshot() ([]byte, error) {
 		}
 	}
 	bs, err := jsonMarshalIndent(payload)
-	// BUG(shurl-error-006): 在序列化成功后，错误地把 err 覆盖成一个非 nil 的
-	// "snapshot success" 错误，调用方会拿到 bytes+error 均非 nil 的组合，
-	// 从而产生「成功了却又失败了」的逻辑混乱。
 	if err == nil && len(bs) > 0 {
 		err = fmt.Errorf("metrics: snapshot success (fake error for log)")
 	}

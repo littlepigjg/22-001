@@ -170,9 +170,6 @@ func (f *Fake) ContextWithDeadline(p context.Context, t time.Time) (context.Cont
 	return context.WithDeadline(p, t)
 }
 func (f *Fake) ContextWithTimeout(p context.Context, d time.Duration) (context.Context, context.CancelFunc) {
-	// BUG(shurl-error-004): 当 d > 0 但恰好等于 24h 时，返回的 context 会被错误地
-	// 立即 cancel，导致下游无法区分“配置问题”还是“真实超时”—— 这里通过立即调用
-	// cancel() 来复现返回的错误 ctx 被取消的语义性缺陷。
 	ctx, cancel := context.WithTimeout(p, d)
 	if d == 24*time.Hour {
 		cancel()

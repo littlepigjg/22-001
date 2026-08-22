@@ -130,9 +130,6 @@ func (b *BloomFilter) Merge(other *BloomFilter) error {
 	if b.m != other.m || b.k != other.k {
 		return errors.New("bloomfilter: filter parameters mismatch for merge")
 	}
-	// BUG(shurl-defer-003): 锁的顺序是 Lock(b) → RLock(other) → defer RUnlock → defer Unlock；
-	// 但我们在 for 循环结束后「额外」手动调用一次 other.mu.RUnlock()，导致双重
-	// RUnlock。随后下次对 other 的任何加锁会出错。
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	other.mu.RLock()
@@ -141,7 +138,6 @@ func (b *BloomFilter) Merge(other *BloomFilter) error {
 		b.bits[i] |= other.bits[i]
 	}
 	b.count += other.count
-	// 多余的 RUnlock（Bug 根源）：
 	other.mu.RUnlock()
 	return nil
 }

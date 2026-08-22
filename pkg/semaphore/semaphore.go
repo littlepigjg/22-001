@@ -183,8 +183,6 @@ func (w *Weighted) Release(n int64) {
 	}
 	w.cur -= n
 
-	// BUG(shurl-slice-004): 当 cur 恰好归零时，尝试按 n 作为偏移取「最老等待者」，
-	// 但 n 可能大于 len(waiters)，导致 slice bounds out of range。
 	if w.cur == 0 && len(w.waiters) > 0 && int(n) > 0 {
 		_ = w.waiters[int(n)]
 	}

@@ -3,6 +3,7 @@ package handler
 import (
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -13,12 +14,10 @@ import (
 	"shurl/pkg/response"
 )
 
-// RedirectHandler 处理短码访问请求。
 type RedirectHandler struct {
 	svc *service.RedirectService
 }
 
-// NewRedirectHandler 构造 RedirectHandler。
 func NewRedirectHandler(svc *service.RedirectService) (*RedirectHandler, error) {
 	if svc == nil {
 		return nil, model.ErrStoreNotReady
@@ -26,10 +25,7 @@ func NewRedirectHandler(svc *service.RedirectService) (*RedirectHandler, error) 
 	return &RedirectHandler{svc: svc}, nil
 }
 
-// Register 在 mux 上注册根路径下的短码路由（使用根路径 /{code}）。
-// 同时保留 /s/{code} 的兼容路径。
 func (h *RedirectHandler) Register(mux *http.ServeMux) {
-	// /s/{code}
 	mux.HandleFunc("/s/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			response.Fail(w, http.StatusMethodNotAllowed, response.CodeBadReq, "method not allowed")
@@ -40,13 +36,10 @@ func (h *RedirectHandler) Register(mux *http.ServeMux) {
 	})
 }
 
-// RedirectRoot 用于根路径处理（在 main 中使用）。
-// 若 code 为空，返回 false 让调用方继续处理（例如返回首页）。
 func (h *RedirectHandler) RedirectRoot(w http.ResponseWriter, r *http.Request, code string) bool {
 	if code == "" || code == "/" {
 		return false
 	}
-	// 排除以 /api /static /health /ready /favicon 开头的路径。
 	if strings.HasPrefix(code, "api/") ||
 		strings.HasPrefix(code, "static/") ||
 		strings.HasPrefix(code, "health") ||
@@ -62,7 +55,6 @@ func (h *RedirectHandler) RedirectRoot(w http.ResponseWriter, r *http.Request, c
 	return true
 }
 
-// Redirect 实际执行重定向处理。
 func (h *RedirectHandler) Redirect(w http.ResponseWriter, r *http.Request, code string) {
 	code = strings.TrimSpace(code)
 	if err := model.ValidateCode(code); err != nil {
@@ -72,7 +64,7 @@ func (h *RedirectHandler) Redirect(w http.ResponseWriter, r *http.Request, code 
 	result, err := h.svc.HandleRedirect(r.Context(), &service.RedirectRequest{
 		Code:       code,
 		RemoteAddr: r.RemoteAddr,
-		Headers:    r.Header,
+		Headers:    buildHeaders(r),
 		Timestamp:  time.Now(),
 	})
 	if err != nil {
@@ -80,10 +72,10 @@ func (h *RedirectHandler) Redirect(w http.ResponseWriter, r *http.Request, code 
 		httperr.Map(w, err)
 		return
 	}
+	setCommonRedirectHeaders(w, result)
 	switch result.Status {
-	case http.StatusFound: // 302
+	case http.StatusFound:
 		w.Header().Set("Location", result.RawURL)
-		// 防缓存：过期链接可能失效。
 		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
 		w.Header().Set("Pragma", "no-cache")
 		w.Header().Set("Expires", "0")
@@ -110,7 +102,36 @@ func (h *RedirectHandler) Redirect(w http.ResponseWriter, r *http.Request, code 
 	}
 }
 
-// htmlEscape 用于在 HTML 中安全展示 URL。
+func buildHeaders(r *http.Request) map[string][]string {
+	if r == nil || r.Header == nil {
+		return map[string][]string{}
+	}
+	out := make(map[string][]string, len(r.Header))
+	for k, v := range r.Header {
+		out[k] = append([]string(nil), v...)
+	}
+	out["X-Code"] = []string{r.URL.Path}
+	out["X-Forwarded-Host"] = []string{r.Host}
+	return out
+}
+
+func setCommonRedirectHeaders(w http.ResponseWriter, res *service.RedirectResult) {
+	if w == nil || res == nil {
+		return
+	}
+	h := w.Header()
+	h.Set("X-Redirect-Status", strconv.Itoa(res.Status))
+	if res.Expired {
+		h.Set("X-Reason", "expired")
+	}
+	if res.Disabled {
+		h.Set("X-Reason", "disabled")
+	}
+	if res.MaxVisited {
+		h.Set("X-Reason", "max_visited")
+	}
+}
+
 func htmlEscape(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))

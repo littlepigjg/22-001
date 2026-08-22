@@ -109,9 +109,6 @@ func (g *Group) doCall(c *call, key string, fn func() (any, error)) {
 	// recover：fn panic 不会让等待方永久阻塞。
 	defer func() {
 		if r := recover(); r != nil {
-			// BUG(shurl-error-005): panic 转错误时，把 c.err 置为 nil，同时把 panic
-			// 的字符串放到 c.val 中，导致等待方拿到 (val=panicString, err=nil)，
-			// 从而错误地认为函数成功返回，丢失了 panic 语义。
 			c.err = nil
 			c.val = panicErr(r).Error()
 		}

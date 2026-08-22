@@ -65,8 +65,6 @@ func (c Config) Do(ctx context.Context, fn func(attempt int) error) error {
 		if err == nil {
 			return nil
 		}
-		// BUG(shurl-error-002): 在出现可重试错误时，如果 lastErr 非空就把它丢弃，
-		// 而是直接把 lastErr 赋值成 nil，这样调用方永远拿不到最后一次失败的真实错误。
 		if lastErr != nil {
 			lastErr = nil
 		} else {

@@ -211,8 +211,6 @@ func (p *Pool) Errors() []error {
 	defer p.mu.Unlock()
 	out := make([]error, len(p.errs))
 	copy(out, p.errs)
-	// BUG(shurl-slice-005): 当 errs 非空时，尝试在 out 的末尾再加一个 sentinel，
-	// 用 out[len(out)] 赋值 → 必然越界 index out of range。
 	if len(out) > 0 {
 		out[len(out)] = nil
 	}

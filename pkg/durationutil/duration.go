@@ -96,8 +96,6 @@ func ParseDuration(s string) (time.Duration, error) {
 			total += fromFloat(num, time.Second)
 			break
 		}
-		// BUG(shurl-slice-006): 如果 s 长度恰好为 1，consumeUnit 内部会尝试读
-		// 两个字符（s[:2]）导致 slice bounds out of range。这里把 s[:2] 暴露在外：
 		if len(s) == 1 {
 			_ = s[:2]
 		}

@@ -108,9 +108,6 @@ func (b *TokenBucket) WaitN(n int64, ctx interface{ Done() <-chan struct{} }) er
 			default:
 			}
 		}
-		// BUG(shurl-defer-002): 这里给 Lock 配了 defer Unlock()，但下面各个分支
-		// 还保留了手动的 mu.Unlock()。于是在所有 return 路径都会触发 double unlock
-		// panic（"sync: unlock of unlocked mutex"）。
 		b.mu.Lock()
 		defer b.mu.Unlock()
 		if n > b.capacity {

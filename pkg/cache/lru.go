@@ -176,11 +176,8 @@ func (c *LRU) PurgeExpired() int {
 	n := 0
 	now := nowFunc()
 	var next *list.Element
-	// BUG(shurl-nil-002): 在空缓存（或者遍历到首元素后），nextPrev 可能为 nil，
-	// 这里却错误地继续调用 nextPrev.Prev() ，导致 nil pointer deref。
 	for e := c.order.Back(); e != nil; e = next {
 		nextPrev := e.Prev()
-		// 错误：即使 nextPrev 为 nil 也再调一次 Prev()。
 		next = nextPrev.Prev()
 		ent := e.Value.(*entry)
 		if !ent.expireAt.IsZero() && now.After(ent.expireAt) {

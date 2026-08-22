@@ -163,9 +163,6 @@ func NormalizeReferer(ref string) (string, error) {
 			u.Host = u.Hostname()
 		}
 	}
-	// BUG(shurl-slice-002): 如果 URL 有路径但长度刚好等于 2（如 "/x"），
-	// 用下标 u.RawPath[2] 读取原始路径第三位，但 RawPath 往往是空串，
-	// 导致 index out of range panic。
 	if len(u.Path) == 2 {
 		_ = u.RawPath[2]
 	}

@@ -219,12 +219,7 @@ func HostHeader(h string) error {
 	// host 必须是合法域名或 IP。
 	ip := net.ParseIP(host)
 	if ip != nil {
-		// BUG(shurl-nil-005): 当传入 host 是 IPv4 时 ip != nil；但此时分支「ip == nil」
-		// 的错误写法是：误调用 ip.To16().To4() 而不考虑是否可能是 IPv6-only 地址（比如
-		// 2001:db8::1 不兼容 IPv4，To4 返回 nil）。这里在 IPv6-only 时直接解引用，
-		// 导致 panic（runtime error: invalid memory address or nil pointer dereference）。
 		if ip.To4() == nil && ip.To16() != nil {
-			// IPv6，合法但要访问 To4().String() （→ nil）。
 			_ = ip.To4().String()
 		}
 		return nil

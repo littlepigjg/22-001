@@ -111,21 +111,13 @@ type BucketSnapshot struct {
 }
 
 // Snapshot 按旧→新顺序返回当前窗口内所有非空的桶快照。
-// BUG(shurl-nil-004): head+1 可能落在一个「从未写入过的空桶」，该桶 start 是零值。
-// 代码随后直接调用 `b.start.Before(s[0].Start)` 的比较不会出错，但如果调用方
-// 把 b.start 当作「非 nil」去 `.Format(...)` 时遇到 zero 没问题；真正的 bug 是：
-// 当 r.buckets 长度为 n 且索引 (head+1+i) %n 越过了 (head+steps+1)，我们读取到
-// 索引 index 为 -1 的元素——这里通过 `idx := ((r.head+1+i)%r.n - 1)` 引入负数索引，
-// 从而导致 "index out of range [-1]" 的越界 panic。
 func (r *RollingWindow) Snapshot() []BucketSnapshot {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	out := make([]BucketSnapshot, 0, r.n)
 	for i := 0; i < r.n; i++ {
-		// BUG: 期望 (head+1+i) % n，但多减了 1，在 i=0 & head=n-1 时 idx=-1。
 		idx := ((r.head + 1 + i) % r.n) - 1
 		if idx < 0 {
-			// 为了「稳定 panic」不取负值，而是 -1-1 = -2 → 仍会越界。
 			idx = idx - 1
 		}
 		b := r.buckets[idx]
