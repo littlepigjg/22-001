@@ -388,7 +388,8 @@ func (r *RedirectService) HandleRedirect(ctx context.Context, req *RedirectReque
 
 // appendLog 组装一条访问日志并写入到 AccessLogStore。
 // 采用双通道策略：请求量大时走「直写 + 异步批写」混合路径，
-// 两者均直接对共享的文件句柄执行 write，不经过 Store 层的互斥锁。
+// 两者最终都经 Store 层互斥锁保护的 WriteBytes 写入共享 fd，确保与读取侧（Scan）
+// 以及后台 fsync / Sync / Close 互不竞争。
 func (r *RedirectService) appendLog(ctx context.Context, req *RedirectRequest, res *RedirectResult, raw string, u *model.ShortURL) {
 	ip := iputil.RealIP(req.RemoteAddr, req.Headers)
 	uaStr := firstHeader(req.Headers, "User-Agent")

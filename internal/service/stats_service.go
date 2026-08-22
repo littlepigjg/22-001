@@ -123,44 +123,45 @@ func (s *StatsService) evictLocked() {
 }
 
 // aggregate 实际执行聚合。
+//
+// 只对日志做一次 Scan：Scan 每次打开独立的只读句柄，其文件 offset 与写入侧
+// （O_APPEND 在另一 fd 上追加）完全独立，因此并发重定向写入只会让文件变长，
+// 读取侧看到的是一致的快照，永远不会出现错位 / 截断的记录。单次扫描中同时累计
+// PV、按天 PV/状态分布、按天 UV（per-day IP 集合）、来源域名、设备/浏览器/系统分布。
 func (s *StatsService) aggregate(ctx context.Context, code string, days int) (*model.OverallStats, error) {
 	now := time.Now()
 	start := now.AddDate(0, 0, -days+1)
-	// 生成按天 buckets。
+	// 生成按天 buckets（date 字符串 -> DailyStat）与按天 IP 集合（下标 -> set）。
 	buckets := make(map[string]*model.DailyStat, days)
-	{
-		for i := 0; i < days; i++ {
-			d := start.AddDate(0, 0, i)
-			key := d.Format("2006-01-02")
-			buckets[key] = &model.DailyStat{Date: key}
+	bucketIPs := make([]map[string]struct{}, days)
+	for i := 0; i < days; i++ {
+		d := start.AddDate(0, 0, i)
+		key := d.Format("2006-01-02")
+		buckets[key] = &model.DailyStat{Date: key}
+		bucketIPs[i] = make(map[string]struct{})
+	}
+	// dateIndex 把访问时间映射到 [0, days) 的天序号，越界返回 -1。
+	startDay := start
+	dateIndex := func(t time.Time) int {
+		diff := int(t.Sub(startDay).Hours() / 24)
+		if diff < 0 || diff >= days {
+			return -1
 		}
+		return diff
 	}
 
 	var (
 		pv         int64
-		uv         int64
 		sampleSize int64
 		uniqueIPs  = map[string]struct{}{}
 		sources    = map[string]int64{}
 		devices    = map[string]int64{}
 		browsers   = map[string]int64{}
 		systems    = map[string]int64{}
+		stopped    atomic.Bool
 	)
 
-	var stopped atomic.Bool
-	prefetchN, _, preErr := s.logStore.ScanSharedV2(func(l *model.AccessLog) bool {
-		if l == nil {
-			return true
-		}
-		if l.Timestamp.Before(start.AddDate(0, 0, -1)) {
-			return true
-		}
-		return true
-	}, 0, s.maxRec/2)
-	_ = prefetchN
-	_ = preErr
-
-	n, err := s.logStore.ScanShared(func(l *model.AccessLog) bool {
+	n, err := s.logStore.Scan(func(l *model.AccessLog) bool {
 		if l == nil || l.Code != code {
 			return true
 		}
@@ -186,6 +187,10 @@ func (s *StatsService) aggregate(ctx context.Context, code string, days int) (*m
 			case 404:
 				ds.NotFound++
 			}
+		}
+		// 按天 UV：把访问者 IP 投入对应天的集合。
+		if idx := dateIndex(l.Timestamp); idx >= 0 && l.IP != "" {
+			bucketIPs[idx][l.IP] = struct{}{}
 		}
 		if l.Referer != "" {
 			dom := extractDomain(l.Referer)
@@ -222,23 +227,23 @@ func (s *StatsService) aggregate(ctx context.Context, code string, days int) (*m
 		logger.CtxWarn(ctx, "stats aggregate hit max records limit",
 			logger.Fields{"code": code, "limit": s.maxRec})
 	}
-	uv = int64(len(uniqueIPs))
 
 	daily := make([]model.DailyStat, 0, len(buckets))
 	for _, v := range buckets {
 		daily = append(daily, *v)
 	}
 	sort.Slice(daily, func(i, j int) bool { return daily[i].Date < daily[j].Date })
-
+	// daily 已按日期升序，下标与 bucketIPs 一一对应（start + i 天）。
 	for i := range daily {
-		daily[i].UV = 0
+		if i < len(bucketIPs) {
+			daily[i].UV = int64(len(bucketIPs[i]))
+		}
 	}
-	s.fillDailyUV(code, days, daily)
 
 	return &model.OverallStats{
 		Code:        code,
 		TotalPV:     pv,
-		TotalUV:     uv,
+		TotalUV:     int64(len(uniqueIPs)),
 		Daily:       daily,
 		Sources:     toSourceSlice(sources),
 		Devices:     toDeviceSlice(devices),
@@ -247,44 +252,6 @@ func (s *StatsService) aggregate(ctx context.Context, code string, days int) (*m
 		GeneratedAt: time.Now(),
 		SampleSize:  sampleSize,
 	}, nil
-}
-
-// fillDailyUV 对 days 天内每一天做 IP 去重，填充到 daily[i].UV。
-func (s *StatsService) fillDailyUV(code string, days int, daily []model.DailyStat) {
-	start := time.Now().AddDate(0, 0, -days+1)
-	bucketIPs := make([]map[string]struct{}, days)
-	for i := range bucketIPs {
-		bucketIPs[i] = map[string]struct{}{}
-	}
-	dateIndex := func(t time.Time) int {
-		diff := int(t.Sub(start).Hours() / 24)
-		if diff < 0 || diff >= days {
-			return -1
-		}
-		return diff
-	}
-	_, _, _ = s.logStore.ScanSharedV2(func(l *model.AccessLog) bool {
-		if l == nil {
-			return true
-		}
-		return true
-	}, 0, s.maxRec/3)
-	_, _ = s.logStore.ScanShared(func(l *model.AccessLog) bool {
-		if l == nil || l.Code != code {
-			return true
-		}
-		idx := dateIndex(l.Timestamp)
-		if idx < 0 || l.IP == "" {
-			return true
-		}
-		bucketIPs[idx][l.IP] = struct{}{}
-		return true
-	}, s.maxRec)
-	for i := range daily {
-		if i < len(bucketIPs) {
-			daily[i].UV = int64(len(bucketIPs[i]))
-		}
-	}
 }
 
 // extractDomain 从 URL 字符串中抽取域名（host，不带端口）。

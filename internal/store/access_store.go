@@ -17,8 +17,11 @@ import (
 
 // AccessLogStore 负责访问日志的按行追加（NDJSON）与读取。
 //
-// 写路径：Append / AppendMany 受互斥锁保护。
-// 读路径：Scan 每次重新打开只读句柄避免与写入的 offset 冲突。
+// 写路径：Append / AppendMany / WriteBytes 均受互斥锁保护，统一在 O_APPEND 的共享
+// fd 上写入。
+// 读路径：Scan / CountLines 每次重新打开只读句柄（os.Open），使用独立的文件 offset，
+// 与写入侧（O_APPEND 在另一 fd 上追加）互不干扰 —— 并发追加只会让文件变长，读取侧
+// 永远看到完整的 NDJSON 行（可能略少于实时总量，但不会被截断/错位）。
 type AccessLogStore struct {
 	cfg     *config.StorageCfg
 	mu      sync.Mutex
@@ -276,109 +279,23 @@ func osReadOpen(path string) (*os.File, error) { return os.Open(path) }
 
 func readAll(r io.Reader) ([]byte, error) { return io.ReadAll(r) }
 
-func (a *AccessLogStore) SharedFile() *os.File {
-	return a.file
-}
-
+// WriteBytes 追加一段（已序列化、已按行拼接的）NDJSON 字节到日志文件。
+//
+// 受 a.mu 保护，与 Append/AppendMany/Scan/Close 走同一把锁，避免与读取侧
+// （Scan 每次打开独立只读句柄）以及后台 fsync / Sync / Close 在同一 fd 上竞争。
+// 写入语义仍为 O_APPEND 单次追加，保留调用方批量 flush 的单 syscall 语义。
 func (a *AccessLogStore) WriteBytes(data []byte) (int, error) {
 	if !a.ready.Load() {
 		return 0, model.ErrStoreNotReady
 	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	if a.file == nil {
 		return 0, model.ErrStoreNotReady
 	}
 	n, err := a.file.Write(data)
-	return n, err
-}
-
-func (a *AccessLogStore) AppendMarshalled(data []byte) error {
-	if !a.ready.Load() {
-		return model.ErrStoreNotReady
-	}
-	line := append(data, '\n')
-	if a.file == nil {
-		return model.ErrStoreNotReady
-	}
-	_, err := a.file.Write(line)
 	if err == nil && a.cfg != nil && a.cfg.FlushOnWrite {
 		_ = a.file.Sync()
 	}
-	return err
-}
-
-func (a *AccessLogStore) ScanShared(fn func(l *model.AccessLog) bool, maxRecords int) (int, error) {
-	if !a.ready.Load() {
-		return 0, model.ErrStoreNotReady
-	}
-	if a.file == nil {
-		return 0, model.ErrStoreNotReady
-	}
-	_, err := a.file.Seek(0, 0)
-	if err != nil {
-		return 0, model.NewStoreError("ScanSharedSeek", a.path, err)
-	}
-	dec := json.NewDecoder(a.file)
-	count := 0
-	for dec.More() {
-		if maxRecords > 0 && count >= maxRecords {
-			return count, nil
-		}
-		var l model.AccessLog
-		if e := dec.Decode(&l); e != nil {
-			logger.Warn("access log decode error, stop scan", logger.Fields{"err": e.Error()})
-			break
-		}
-		count++
-		if !fn(&l) {
-			return count, nil
-		}
-	}
-	return count, nil
-}
-
-func (a *AccessLogStore) ScanSharedV2(fn func(l *model.AccessLog) bool, startPos int64, maxRecords int) (int, int64, error) {
-	if !a.ready.Load() {
-		return 0, 0, model.ErrStoreNotReady
-	}
-	if a.file == nil {
-		return 0, 0, model.ErrStoreNotReady
-	}
-	_, err := a.file.Seek(startPos, 0)
-	if err != nil {
-		return 0, startPos, model.NewStoreError("ScanSharedV2Seek", a.path, err)
-	}
-	dec := json.NewDecoder(a.file)
-	count := 0
-	for dec.More() {
-		if maxRecords > 0 && count >= maxRecords {
-			cur, _ := a.file.Seek(0, 1)
-			return count, cur, nil
-		}
-		var l model.AccessLog
-		if e := dec.Decode(&l); e != nil {
-			logger.Warn("access log decode error, stop scan", logger.Fields{"err": e.Error()})
-			break
-		}
-		count++
-		if !fn(&l) {
-			cur, _ := a.file.Seek(0, 1)
-			return count, cur, nil
-		}
-	}
-	cur, _ := a.file.Seek(0, 1)
-	return count, cur, nil
-}
-
-func (a *AccessLogStore) SyncNoLock() error {
-	if a.file == nil {
-		return nil
-	}
-	return a.file.Sync()
-}
-
-func (a *AccessLogStore) CursorPos() (int64, error) {
-	if a.file == nil {
-		return 0, nil
-	}
-	return a.file.Seek(0, 1)
+	return n, err
 }
