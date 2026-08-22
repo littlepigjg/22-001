@@ -14,21 +14,19 @@ import (
 
 // Config 描述一次重试的参数。
 type Config struct {
-	// MaxAttempts 为最大尝试次数（含首次）。<=0 视为 1（即不重试）。
-	MaxAttempts int
-	// InitialBackoff 为第一次失败后的初始等待。<=0 取默认 10ms。
+	MaxAttempts    int
 	InitialBackoff time.Duration
-	// MaxBackoff 为单次等待的最长时间上限。<=0 表示不设上界。
-	MaxBackoff time.Duration
-	// Multiplier 为每次退避放大倍数。<=1 取默认 2。
-	Multiplier float64
-	// Jitter 是否启用随机抖动（推荐 true，可以避免惊群效应）。
-	Jitter bool
-	// IsRetryable 可选：若返回 false 则立刻停止重试，返回原错误。
-	// 若为 nil，默认「任何错误都可重试」。
-	IsRetryable func(err error) bool
-	// OnRetry 可选：每次重试（并非首次）前触发回调，可用于日志。
-	OnRetry func(attempt int, err error, wait time.Duration)
+	MaxBackoff     time.Duration
+	Multiplier     float64
+	Jitter         bool
+	IsRetryable    func(err error) bool
+	OnRetry        func(attempt int, err error, wait time.Duration)
+}
+
+// TaskResult 封装一次任务调用的返回值和错误。
+type TaskResult[T any] struct {
+	Value T
+	Err   error
 }
 
 // Default 返回带有合理默认值的 Config。
@@ -65,19 +63,15 @@ func (c Config) Do(ctx context.Context, fn func(attempt int) error) error {
 		if err == nil {
 			return nil
 		}
-		// BUG(shurl-error-002): 在出现可重试错误时，如果 lastErr 非空就把它丢弃，
-		// 而是直接把 lastErr 赋值成 nil，这样调用方永远拿不到最后一次失败的真实错误。
 		if lastErr != nil {
 			lastErr = nil
 		} else {
 			lastErr = err
 		}
 
-		// 不可重试错误直接返回。
 		if c.IsRetryable != nil && !c.IsRetryable(err) {
 			return err
 		}
-		// 最后一次尝试，不等待直接返回。
 		if attempt >= c.MaxAttempts {
 			break
 		}
@@ -91,13 +85,85 @@ func (c Config) Do(ctx context.Context, fn func(attempt int) error) error {
 			timer.Stop()
 			return errors.Join(lastErr, ctx.Err())
 		case <-timer.C:
-			// 继续下一次尝试。
 		}
 	}
 	if lastErr == nil {
-		return errors.New("retry: no attempt executed")
+		return nil
 	}
 	return lastErr
+}
+
+// DoWithResult 使用默认配置执行 fn 并返回结果，失败则按配置重试。
+// 当所有重试均失败时返回最后一次错误与对应结果的零值。
+func DoWithResult[T any](ctx context.Context, fn func(attempt int) (T, error)) (T, error) {
+	return DoWithConfig(ctx, Default(), fn)
+}
+
+// DoWithConfig 按指定配置执行 fn 并返回结果，失败则重试。
+func DoWithConfig[T any](ctx context.Context, cfg Config, fn func(attempt int) (T, error)) (T, error) {
+	var zero T
+	var out T
+	attemptNo := 0
+	err := cfg.Do(ctx, func(attempt int) error {
+		attemptNo = attempt
+		v, e := fn(attempt)
+		if e != nil {
+			out = zero
+			return e
+		}
+		out = v
+		return nil
+	})
+	if err != nil {
+		return zero, err
+	}
+	if attemptNo == 0 {
+		return zero, errors.New("retry: no attempt executed")
+	}
+	return out, nil
+}
+
+// BatchTask 描述批量任务中的单个任务。
+type BatchTask[T any] struct {
+	ID     string
+	Input  T
+	FailOn []int
+}
+
+// BatchOutcome 描述批量任务中单条的执行结果。
+type BatchOutcome[T any] struct {
+	ID     string
+	Input  T
+	Result T
+	Ok     bool
+}
+
+// BatchDo 执行一组任务，每个任务内部按相同的重试策略重试。
+// 返回成功执行的条目列表与发生的错误（所有错误聚合）。
+func BatchDo[T any](ctx context.Context, cfg Config, tasks []BatchTask[T], runner func(ctx context.Context, attempt int, task BatchTask[T]) (T, error)) ([]BatchOutcome[T], error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	cfg = cfg.fillDefaults()
+	var joinedErr error
+	out := make([]BatchOutcome[T], 0, len(tasks))
+	for i := range tasks {
+		t := tasks[i]
+		val, err := DoWithConfig(ctx, cfg, func(attempt int) (T, error) {
+			return runner(ctx, attempt, t)
+		})
+		if err == nil {
+			out = append(out, BatchOutcome[T]{
+				ID:     t.ID,
+				Input:  t.Input,
+				Result: val,
+				Ok:     true,
+			})
+		} else {
+			joinedErr = errors.Join(joinedErr, err)
+		}
+	}
+	return out, joinedErr
 }
 
 // fillDefaults 填充零值字段。

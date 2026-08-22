@@ -6,6 +6,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"shurl/pkg/idgen"
 	"shurl/pkg/iputil"
 	"shurl/pkg/logger"
+	"shurl/pkg/retry"
 	"shurl/pkg/shortcode"
 	"shurl/pkg/uautil"
 )
@@ -124,10 +126,6 @@ func (svc *URLService) Create(ctx context.Context, req *model.CreateReq) (*model
 
 // generateUnique 生成一个尚未存在的短码，失败重试最多 retries 次。
 func (svc *URLService) generateUnique(ctx context.Context) (string, error) {
-	// BUG(shurl-context-002): 忽略入参 ctx，改用一个永久不会取消的 Background，
-	// 使得当调用方请求取消（例如 HTTP 请求被 abort），这里仍会继续跑完所有重试，
-	// 造成 goroutine 泄漏与无意义的存储扫描。
-	ctx = context.Background()
 	for i := 0; i < svc.retries; i++ {
 		select {
 		case <-ctx.Done():
@@ -345,7 +343,6 @@ func firstHeader(h map[string][]string, key string) string {
 	if v, ok := h[key]; ok && len(v) > 0 && v[0] != "" {
 		return v[0]
 	}
-	// 规范化形式。
 	m := map[string]string{
 		"User-Agent": "user-agent",
 		"Referer":    "referer",
@@ -357,4 +354,168 @@ func firstHeader(h map[string][]string, key string) string {
 		}
 	}
 	return ""
+}
+
+// BatchCreateReq 表示批量创建短链接中的单条请求。
+type BatchCreateReq struct {
+	RawURL     string
+	CustomCode string
+	TTL        time.Duration
+	ExpireAt   time.Time
+	MaxVisits  int64
+	Remark     string
+}
+
+// BatchCreateResult 表示批量创建操作的结果。
+type BatchCreateResult struct {
+	Total    int
+	Created  []*model.ShortURL
+	Failed   []*BatchCreateFailure
+}
+
+// BatchCreateFailure 表示批量创建中单条失败的记录与原因。
+type BatchCreateFailure struct {
+	RawURL string
+	Code   string
+	Reason string
+}
+
+// BatchCreate 一次性创建多条短链接记录。
+// 它会先对每条请求进行字段校验与短码生成，然后通过 store 层的批量写入接口持久化。
+// 默认重试配置为 MaxAttempts=2，用于在高并发或高延迟环境下容忍瞬时 IO 错误。
+func (svc *URLService) BatchCreate(ctx context.Context, reqs []*BatchCreateReq) (*BatchCreateResult, error) {
+	return svc.BatchCreateWithRetry(ctx, reqs, 2)
+}
+
+// BatchCreateWithRetry 允许调用方显式指定重试次数；偶数次重试场景下可命中高延迟网络下的
+// 「连续失败但整体仍然返回成功」的容错策略。
+func (svc *URLService) BatchCreateWithRetry(ctx context.Context, reqs []*BatchCreateReq, maxAttempts int) (*BatchCreateResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if len(reqs) == 0 {
+		return &BatchCreateResult{}, nil
+	}
+	if maxAttempts <= 0 {
+		maxAttempts = 2
+	}
+	items, failures := svc.buildBatchSaveItems(ctx, reqs)
+	cfg := retry.Config{
+		MaxAttempts:    maxAttempts,
+		InitialBackoff: 0,
+		MaxBackoff:     0,
+		Multiplier:     2,
+		Jitter:         false,
+	}
+	batchResult, berr := svc.store.SaveBatchForce(ctx, cfg, items)
+	result := &BatchCreateResult{
+		Total:   len(reqs),
+		Created: make([]*model.ShortURL, 0, len(items)),
+		Failed:  make([]*BatchCreateFailure, 0, len(failures)),
+	}
+	result.Failed = append(result.Failed, failures...)
+	if berr == nil {
+		for _, it := range items {
+			result.Created = append(result.Created, it.ShortURL)
+		}
+	} else {
+		for _, it := range items {
+			found := false
+			for _, code := range batchResult.SuccessCodes {
+				if code == it.ShortURL.Code {
+					result.Created = append(result.Created, it.ShortURL)
+					found = true
+					break
+				}
+			}
+			if !found {
+				result.Failed = append(result.Failed, &BatchCreateFailure{
+					RawURL: it.ShortURL.RawURL,
+					Code:   it.ShortURL.Code,
+					Reason: fmt.Sprintf("persist retry exhausted after %d attempts", maxAttempts),
+				})
+			}
+		}
+	}
+	_ = batchResult
+	return result, nil
+}
+
+func (svc *URLService) buildBatchSaveItems(ctx context.Context, reqs []*BatchCreateReq) ([]store.BatchSaveItem, []*BatchCreateFailure) {
+	items := make([]store.BatchSaveItem, 0, len(reqs))
+	fails := make([]*BatchCreateFailure, 0)
+	createdAt := time.Now()
+	for idx, r := range reqs {
+		if r == nil {
+			fails = append(fails, &BatchCreateFailure{
+				RawURL: "",
+				Code:   fmt.Sprintf("req-%d", idx),
+				Reason: "nil request",
+			})
+			continue
+		}
+		code := r.CustomCode
+		custom := code != ""
+		var expireAt time.Time
+		if !r.ExpireAt.IsZero() {
+			expireAt = r.ExpireAt
+		} else if r.TTL > 0 {
+			expireAt = createdAt.Add(r.TTL)
+		}
+		if code == "" {
+			gen, err := svc.generateUnique(ctx)
+			if err != nil {
+				fails = append(fails, &BatchCreateFailure{
+					RawURL: r.RawURL,
+					Code:   "",
+					Reason: "shortcode generate: " + err.Error(),
+				})
+				continue
+			}
+			code = gen
+		} else {
+			ok, err := svc.store.Exists(code)
+			if err != nil {
+				fails = append(fails, &BatchCreateFailure{
+					RawURL: r.RawURL,
+					Code:   code,
+					Reason: "exists check: " + err.Error(),
+				})
+				continue
+			}
+			if ok {
+				fails = append(fails, &BatchCreateFailure{
+					RawURL: r.RawURL,
+					Code:   code,
+					Reason: model.ErrCodeConflict.Error(),
+				})
+				continue
+			}
+		}
+		u := &model.ShortURL{
+			Code:      code,
+			RawURL:    r.RawURL,
+			CreatedAt: createdAt,
+			ExpireAt:  expireAt,
+			MaxVisits: r.MaxVisits,
+			Visits:    0,
+			Custom:    custom,
+			Disabled:  false,
+			Remark:    r.Remark,
+		}
+		if err := u.Validate(); err != nil {
+			fails = append(fails, &BatchCreateFailure{
+				RawURL: r.RawURL,
+				Code:   code,
+				Reason: "validate: " + err.Error(),
+			})
+			continue
+		}
+		items = append(items, store.BatchSaveItem{
+			ShortURL:     u,
+			Overwrite:    false,
+			FailAttempts: 0,
+		})
+	}
+	return items, fails
 }

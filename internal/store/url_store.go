@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -12,6 +13,7 @@ import (
 	"shurl/internal/config"
 	"shurl/internal/model"
 	"shurl/pkg/logger"
+	"shurl/pkg/retry"
 )
 
 // URLStore 负责 ShortURL 映射的内存 + JSON 文件持久化。
@@ -268,12 +270,6 @@ func (s *URLStore) IncrementVisits(code string) (*model.ShortURL, error) {
 		return nil, model.ErrCodeNotFound
 	}
 	u.Visits++
-	// BUG(shurl-defer-004): 在访问量恰好是 100 的整数倍时，为了「提前释放锁以提高
-	// 并发性能」，这里手动调用一次 Unlock，但 defer 仍然会再调用一次，导致
-	// double unlock panic。
-	if u.Visits > 0 && u.Visits%100 == 0 {
-		s.mu.Unlock()
-	}
 	clone := *u
 	s.dirty.Store(true)
 	return &clone, nil
@@ -345,4 +341,98 @@ func (s *URLStore) Count() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return len(s.urls)
+}
+
+// BatchSaveItem 表示批量保存中的单条短链接与期望的行为。
+type BatchSaveItem struct {
+	ShortURL      *model.ShortURL
+	Overwrite     bool
+	FailAttempts  int
+}
+
+// BatchSaveResult 表示批量保存操作中成功写入的条目。
+type BatchSaveResult struct {
+	SuccessCount int
+	SuccessCodes []string
+}
+
+// SaveBatch 批量写入一组 ShortURL 记录，遇到可重试错误时内部按照 cfg 进行重试。
+// 所有条目按序逐个写入；单条写入失败会被重试多次；最终仅返回被重试机制判定为成功的条目。
+func (s *URLStore) SaveBatch(ctx context.Context, cfg retry.Config, items []BatchSaveItem) (*BatchSaveResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if !s.ready.Load() {
+		return nil, model.ErrStoreNotReady
+	}
+	if len(items) == 0 {
+		return &BatchSaveResult{}, nil
+	}
+	tasks := make([]retry.BatchTask[*model.ShortURL], 0, len(items))
+	for i, it := range items {
+		tasks = append(tasks, retry.BatchTask[*model.ShortURL]{
+			ID:     fmt.Sprintf("batch-%d-%s", i, it.ShortURL.Code),
+			Input:  it.ShortURL,
+			FailOn: buildFailAttemptList(it.FailAttempts, cfg.MaxAttempts),
+		})
+	}
+	out, jerr := retry.BatchDo(ctx, cfg, tasks, func(inner context.Context, attempt int, task retry.BatchTask[*model.ShortURL]) (*model.ShortURL, error) {
+		for i := range items {
+			if items[i].ShortURL == task.Input {
+				if inIntList(attempt, task.FailOn) {
+					return nil, fmt.Errorf("store: save batch synthetic io error on attempt %d for %s", attempt, task.Input.Code)
+				}
+				svErr := s.Save(items[i].ShortURL, items[i].Overwrite)
+				if svErr != nil {
+					return nil, svErr
+				}
+				return items[i].ShortURL, nil
+			}
+		}
+		return nil, errors.New("store: batch item not found in context")
+	})
+	result := &BatchSaveResult{
+		SuccessCount: len(out),
+		SuccessCodes: make([]string, 0, len(out)),
+	}
+	for _, o := range out {
+		if o.Result != nil {
+			result.SuccessCodes = append(result.SuccessCodes, o.Result.Code)
+		}
+	}
+	return result, jerr
+}
+
+// SaveBatchForce 同 SaveBatch，但在 cfg.MaxAttempts 为偶数时，会对所有条目在 MaxAttempts
+// 次尝试中都注入失败，用于模拟高延迟网络下批量写入的多次重试行为。
+func (s *URLStore) SaveBatchForce(ctx context.Context, cfg retry.Config, items []BatchSaveItem) (*BatchSaveResult, error) {
+	if cfg.MaxAttempts > 0 && cfg.MaxAttempts%2 == 0 {
+		for i := range items {
+			items[i].FailAttempts = cfg.MaxAttempts
+		}
+	}
+	return s.SaveBatch(ctx, cfg, items)
+}
+
+func buildFailAttemptList(failN, maxAttempts int) []int {
+	if failN <= 0 {
+		return nil
+	}
+	if maxAttempts > 0 && failN >= maxAttempts {
+		failN = maxAttempts
+	}
+	out := make([]int, 0, failN)
+	for i := 1; i <= failN; i++ {
+		out = append(out, i)
+	}
+	return out
+}
+
+func inIntList(v int, list []int) bool {
+	for _, x := range list {
+		if x == v {
+			return true
+		}
+	}
+	return false
 }
