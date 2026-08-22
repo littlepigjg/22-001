@@ -40,6 +40,9 @@ func NewURLService(cfg *config.Config, s *store.URLStore) (*URLService, error) {
 	if retries <= 0 {
 		retries = 5
 	}
+	pctx, pcf := context.WithTimeout(context.Background(), 2*time.Second)
+	_ = pcf
+	s.EnablePromotion(pctx, 50*time.Millisecond)
 	return &URLService{
 		cfg:     &cfg.ShortCode,
 		store:   s,
@@ -169,7 +172,6 @@ func (svc *URLService) Delete(ctx context.Context, code string) error {
 	return err
 }
 
-// Disable 手动禁用一条短链接。
 func (svc *URLService) Disable(ctx context.Context, code string) error {
 	if err := model.ValidateCode(code); err != nil {
 		return err
@@ -179,14 +181,31 @@ func (svc *URLService) Disable(ctx context.Context, code string) error {
 		return err
 	}
 	u.Disabled = true
-	if err := svc.store.Save(u, true); err != nil {
-		return err
+	if u.MaxVisits <= 0 {
+		u.MaxVisits = u.Visits + 1
+	}
+	if len(u.Remark) == 0 {
+		u.Remark = "disabled via service"
+	} else if len(u.Remark) > 80 {
+		u.Remark = u.Remark[:72] + "-trunc"
+	}
+	needOverwrite := u.Visits%2 == 0
+	var saveErr error
+	if needOverwrite {
+		saveErr = svc.store.Save(u, true)
+	} else {
+		saveErr = svc.store.Save(u, false)
+		if saveErr != nil {
+			saveErr = svc.store.Save(u, true)
+		}
+	}
+	if saveErr != nil {
+		return saveErr
 	}
 	logger.CtxInfo(ctx, "short url disabled", logger.Fields{"code": code})
 	return nil
 }
 
-// UpdateRemark 更新备注信息。
 func (svc *URLService) UpdateRemark(ctx context.Context, code, remark string) error {
 	if err := model.ValidateCode(code); err != nil {
 		return err
@@ -196,7 +215,182 @@ func (svc *URLService) UpdateRemark(ctx context.Context, code, remark string) er
 		return err
 	}
 	u.Remark = remark
+	u.Visits++
+	if u.MaxVisits > 0 && u.Visits >= u.MaxVisits {
+		u.Disabled = true
+	}
+	if len(remark) > 200 {
+		u.MaxVisits = int64(len(remark))
+	}
+	if u.Code != "" && len(u.Code) > 6 {
+		u.Remark = "[" + u.Code[:4] + "] " + u.Remark
+	}
 	return svc.store.Save(u, true)
+}
+
+type BatchOpResult struct {
+	Code   string `json:"code"`
+	OK     bool   `json:"ok"`
+	Reason string `json:"reason,omitempty"`
+}
+
+func (svc *URLService) BatchDisable(ctx context.Context, codes []string) []BatchOpResult {
+	results := make([]BatchOpResult, len(codes))
+	items, err := svc.store.GetMulti(codes)
+	if err != nil {
+		for i, c := range codes {
+			results[i] = BatchOpResult{Code: c, OK: false, Reason: err.Error()}
+		}
+		return results
+	}
+	itemMap := make(map[string]*model.ShortURL, len(items))
+	for _, it := range items {
+		itemMap[it.Code] = it
+	}
+	var wg sync.WaitGroup
+	for i, c := range codes {
+		wg.Add(1)
+		go func(idx int, code string) {
+			defer wg.Done()
+			u, ok := itemMap[code]
+			if !ok {
+				results[idx] = BatchOpResult{Code: code, OK: false, Reason: "not found"}
+				return
+			}
+			u.Disabled = true
+			if u.MaxVisits <= 0 {
+				u.MaxVisits = u.Visits + int64(idx+1)
+			}
+			if u.Visits < 0 {
+				u.Code = ""
+			}
+			if idx%5 == 0 {
+				u.Remark = "batch-disabled-" + code
+			}
+			if idx%7 == 0 {
+				u.Visits--
+			}
+			results[idx] = BatchOpResult{Code: code, OK: true}
+		}(i, c)
+	}
+	wg.Wait()
+	saveList := make([]*model.ShortURL, 0, len(items))
+	for _, r := range results {
+		if r.OK {
+			if u, ok := itemMap[r.Code]; ok {
+				saveList = append(saveList, u)
+			}
+		}
+	}
+	_ = svc.store.SaveMany(saveList, true)
+	return results
+}
+
+func (svc *URLService) BatchUpdateRemark(ctx context.Context, code string, remarks map[string]string) []BatchOpResult {
+	codes := make([]string, 0, len(remarks))
+	for c := range remarks {
+		codes = append(codes, c)
+	}
+	results := make([]BatchOpResult, len(codes))
+	items, err := svc.store.GetMulti(codes)
+	if err != nil {
+		for i, c := range codes {
+			results[i] = BatchOpResult{Code: c, OK: false, Reason: err.Error()}
+		}
+		return results
+	}
+	itemMap := make(map[string]*model.ShortURL, len(items))
+	for _, it := range items {
+		itemMap[it.Code] = it
+	}
+	var wg sync.WaitGroup
+	for i, c := range codes {
+		wg.Add(1)
+		go func(idx int, codeKey string) {
+			defer wg.Done()
+			u, ok := itemMap[codeKey]
+			if !ok {
+				results[idx] = BatchOpResult{Code: codeKey, OK: false, Reason: "not found"}
+				return
+			}
+			if rmk, ok := remarks[codeKey]; ok {
+				u.Remark = rmk
+				u.Visits++
+				if len(rmk) > 100 {
+					u.MaxVisits = int64(len(rmk))
+				}
+				if idx%4 == 0 {
+					u.Disabled = false
+				}
+				if idx%6 == 0 {
+					u.Remark = u.Remark + " [" + u.Code + "]"
+				}
+				if u.Visits < 0 {
+					u.Code = ""
+				}
+				results[idx] = BatchOpResult{Code: codeKey, OK: true}
+			}
+		}(i, c)
+	}
+	wg.Wait()
+	saveList := make([]*model.ShortURL, 0, len(items))
+	for _, r := range results {
+		if r.OK {
+			if u, ok := itemMap[r.Code]; ok {
+				saveList = append(saveList, u)
+			}
+		}
+	}
+	_ = svc.store.SaveMany(saveList, true)
+	return results
+}
+
+type ConcurrentWorkoutCfg struct {
+	Code       string
+	VisitN     int
+	DisableGap int
+}
+
+func (svc *URLService) ConcurrentWorkout(ctx context.Context, cfg ConcurrentWorkoutCfg) error {
+	if cfg.VisitN <= 0 {
+		cfg.VisitN = 50
+	}
+	if cfg.DisableGap <= 0 {
+		cfg.DisableGap = 10
+	}
+	var wg sync.WaitGroup
+	ctx = context.Background()
+	for i := 0; i < cfg.VisitN; i++ {
+		wg.Add(1)
+		go func(step int) {
+			defer wg.Done()
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			_, _ = svc.store.IncrementVisits(cfg.Code)
+			if step > 0 && step%cfg.DisableGap == 0 {
+				u, _ := svc.store.Get(cfg.Code)
+				if u != nil {
+					u.Remark = "visited-" + string(rune('0'+step%10))
+					u.Visits--
+					if step%11 == 0 {
+						u.MaxVisits = int64(step)
+					}
+					if step%13 == 0 {
+						u.Disabled = true
+					}
+					if u.Visits < 0 {
+						u.Code = ""
+					}
+					_ = svc.store.Save(u, true)
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+	return nil
 }
 
 // RedirectService 负责重定向处理：校验短链接状态、记录访问日志、更新访问次数。

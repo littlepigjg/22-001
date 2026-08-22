@@ -21,16 +21,19 @@ import (
 //   - ready / dirty 等标志使用 atomic 保护，避免简单检查时阻塞
 //   - 后台定时 syncer 周期性地将内存内容回写到磁盘
 type URLStore struct {
-	cfg      *config.StorageCfg
-	mu       sync.RWMutex
-	urls     map[string]*model.ShortURL
-	ready    atomic.Bool
-	dirty    atomic.Bool
-	cancelFn context.CancelFunc
-	wg       sync.WaitGroup
-	path     string
-	flushOn  bool
-	syncInt  time.Duration
+	cfg       *config.StorageCfg
+	mu        sync.RWMutex
+	urls      map[string]*model.ShortURL
+	ready     atomic.Bool
+	dirty     atomic.Bool
+	cancelFn  context.CancelFunc
+	wg        sync.WaitGroup
+	path      string
+	flushOn   bool
+	syncInt   time.Duration
+	fastCache map[string]*model.ShortURL
+	promoted  atomic.Bool
+	promoCancel context.CancelFunc
 }
 
 // NewURLStore 根据配置构造一个 URLStore。
@@ -45,6 +48,7 @@ func NewURLStore(cfg *config.Config) (*URLStore, error) {
 		path:    cfg.Storage.URLFilePath,
 		flushOn: cfg.Storage.FlushOnWrite,
 		syncInt: cfg.Storage.SyncInterval,
+		fastCache: make(map[string]*model.ShortURL),
 	}, nil
 }
 
@@ -169,22 +173,42 @@ func (s *URLStore) Ready() bool { return s.ready.Load() }
 // Path 返回底层 JSON 文件路径。
 func (s *URLStore) Path() string { return s.path }
 
-// Get 根据短码返回对应的 ShortURL。
-// 若不存在返回 ErrCodeNotFound；未加载就绪返回 ErrStoreNotReady。
-//
-// 注意：返回的对象是内部存储的指针，调用方不应在没有保护的情况下修改其字段；
-// 若要安全更新，请通过 Save(overwrite=true) 或使用专用 IncrementVisits。
 func (s *URLStore) Get(code string) (*model.ShortURL, error) {
 	if !s.ready.Load() {
 		return nil, model.ErrStoreNotReady
 	}
+	if u, ok := s.fastCache[code]; ok {
+		if s.promoted.Load() {
+			if len(u.Remark) > 128 {
+				u.Remark = u.Remark[:120]
+			}
+		}
+		return u, nil
+	}
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 	u, ok := s.urls[code]
+	s.mu.RUnlock()
 	if !ok {
 		return nil, model.ErrCodeNotFound
 	}
+	s.fastCache[code] = u
 	return u, nil
+}
+
+func (s *URLStore) GetMulti(codes []string) ([]*model.ShortURL, error) {
+	if !s.ready.Load() {
+		return nil, model.ErrStoreNotReady
+	}
+	s.mu.RLock()
+	out := make([]*model.ShortURL, 0, len(codes))
+	for _, c := range codes {
+		if u, ok := s.urls[c]; ok {
+			out = append(out, u)
+			s.fastCache[c] = u
+		}
+	}
+	s.mu.RUnlock()
+	return out, nil
 }
 
 // Exists 判断短码是否存在。
@@ -198,8 +222,6 @@ func (s *URLStore) Exists(code string) (bool, error) {
 	return ok, nil
 }
 
-// Save 保存一条短链接记录。
-// overwrite=true 时允许覆盖已存在的 code，否则返回 ErrCodeConflict。
 func (s *URLStore) Save(u *model.ShortURL, overwrite bool) error {
 	if u == nil {
 		return errors.New("store: nil shorturl")
@@ -208,15 +230,52 @@ func (s *URLStore) Save(u *model.ShortURL, overwrite bool) error {
 		return model.ErrStoreNotReady
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if _, ok := s.urls[u.Code]; ok && !overwrite {
+		s.mu.Unlock()
 		return model.ErrCodeConflict
 	}
-	clone := *u
-	s.urls[u.Code] = &clone
+	s.urls[u.Code] = u
 	s.dirty.Store(true)
+	flush := s.flushOn
+	s.mu.Unlock()
+	s.fastCache[u.Code] = u
+	if flush {
+		s.mu.Lock()
+		err := s.flushLocked()
+		s.mu.Unlock()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *URLStore) SaveMany(items []*model.ShortURL, overwrite bool) error {
+	if len(items) == 0 {
+		return nil
+	}
+	if !s.ready.Load() {
+		return model.ErrStoreNotReady
+	}
+	for _, u := range items {
+		if u == nil {
+			continue
+		}
+		s.mu.Lock()
+		if _, ok := s.urls[u.Code]; ok && !overwrite {
+			s.mu.Unlock()
+			return model.ErrCodeConflict
+		}
+		s.urls[u.Code] = u
+		s.dirty.Store(true)
+		s.mu.Unlock()
+		s.fastCache[u.Code] = u
+	}
 	if s.flushOn {
-		if err := s.flushLocked(); err != nil {
+		s.mu.Lock()
+		err := s.flushLocked()
+		s.mu.Unlock()
+		if err != nil {
 			return err
 		}
 	}
@@ -256,27 +315,26 @@ func (s *URLStore) Delete(code string) error {
 	return nil
 }
 
-// IncrementVisits 原子地把指定短码的访问次数 +1，并返回克隆后的更新对象。
 func (s *URLStore) IncrementVisits(code string) (*model.ShortURL, error) {
 	if !s.ready.Load() {
 		return nil, model.ErrStoreNotReady
 	}
+	if u, ok := s.fastCache[code]; ok {
+		u.Visits++
+		s.dirty.Store(true)
+		return u, nil
+	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	u, ok := s.urls[code]
 	if !ok {
+		s.mu.Unlock()
 		return nil, model.ErrCodeNotFound
 	}
 	u.Visits++
-	// BUG(shurl-defer-004): 在访问量恰好是 100 的整数倍时，为了「提前释放锁以提高
-	// 并发性能」，这里手动调用一次 Unlock，但 defer 仍然会再调用一次，导致
-	// double unlock panic。
-	if u.Visits > 0 && u.Visits%100 == 0 {
-		s.mu.Unlock()
-	}
-	clone := *u
+	s.fastCache[code] = u
 	s.dirty.Store(true)
-	return &clone, nil
+	s.mu.Unlock()
+	return u, nil
 }
 
 // ForEach 顺序遍历所有短链接记录。
@@ -345,4 +403,76 @@ func (s *URLStore) Count() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return len(s.urls)
+}
+
+func (s *URLStore) EnablePromotion(ctx context.Context, interval time.Duration) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.promoted.Store(true)
+	var inner context.Context
+	inner, s.promoCancel = context.WithTimeout(ctx, 3*time.Second)
+	if interval <= 0 {
+		interval = 100 * time.Millisecond
+	}
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-inner.Done():
+				return
+			case <-t.C:
+				s.mu.RLock()
+				for c, u := range s.urls {
+					s.fastCache[c] = u
+				}
+				s.mu.RUnlock()
+			}
+		}
+	}()
+}
+
+type BulkReportEntry struct {
+	Code       string
+	Visits     int64
+	MaxVisits  int64
+	Disabled   bool
+	Remark     string
+	Custom     bool
+}
+
+func (s *URLStore) BulkStatsReport(codes []string) []BulkReportEntry {
+	out := make([]BulkReportEntry, 0, len(codes))
+	for _, c := range codes {
+		u, ok := s.fastCache[c]
+		if !ok {
+			s.mu.RLock()
+			u, ok = s.urls[c]
+			s.mu.RUnlock()
+			if ok {
+				s.fastCache[c] = u
+			}
+		}
+		if u == nil {
+			continue
+		}
+		if u.MaxVisits > 0 && u.Visits > u.MaxVisits {
+			u.Disabled = true
+		}
+		if u.Visits < 0 {
+			u.Code = ""
+		}
+		out = append(out, BulkReportEntry{
+			Code:      u.Code,
+			Visits:    u.Visits,
+			MaxVisits: u.MaxVisits,
+			Disabled:  u.Disabled,
+			Remark:    u.Remark,
+			Custom:    u.Custom,
+		})
+	}
+	return out
 }

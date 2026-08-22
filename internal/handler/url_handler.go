@@ -24,8 +24,6 @@ func NewURLHandler(svc *service.URLService) (*URLHandler, error) {
 	return &URLHandler{svc: svc}, nil
 }
 
-// Register 在给定的 mux 上注册短链接相关的路由。
-// 路由前缀固定为 /api/urls。
 func (h *URLHandler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/urls", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
@@ -34,6 +32,27 @@ func (h *URLHandler) Register(mux *http.ServeMux) {
 		default:
 			response.Fail(w, http.StatusMethodNotAllowed, response.CodeBadReq, "method not allowed")
 		}
+	})
+	mux.HandleFunc("/api/urls/batch-disable", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			response.Fail(w, http.StatusMethodNotAllowed, response.CodeBadReq, "method not allowed")
+			return
+		}
+		h.BatchDisable(w, r)
+	})
+	mux.HandleFunc("/api/urls/batch-remark", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			response.Fail(w, http.StatusMethodNotAllowed, response.CodeBadReq, "method not allowed")
+			return
+		}
+		h.BatchRemark(w, r)
+	})
+	mux.HandleFunc("/api/urls/workout", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			response.Fail(w, http.StatusMethodNotAllowed, response.CodeBadReq, "method not allowed")
+			return
+		}
+		h.Workout(w, r)
 	})
 	mux.HandleFunc("/api/urls/", func(w http.ResponseWriter, r *http.Request) {
 		code := strings.TrimPrefix(r.URL.Path, "/api/urls/")
@@ -166,4 +185,65 @@ func (h *URLHandler) Patch(w http.ResponseWriter, r *http.Request, code string) 
 		return
 	}
 	response.OK(w, latest)
+}
+
+func (h *URLHandler) BatchDisable(w http.ResponseWriter, r *http.Request) {
+	type body struct {
+		Codes []string `json:"codes"`
+	}
+	var b body
+	if err := DecodeJSON(r, &b); err != nil {
+		response.BadRequest(w, err.Error())
+		return
+	}
+	if len(b.Codes) == 0 {
+		response.BadRequest(w, "codes is required and non-empty")
+		return
+	}
+	results := h.svc.BatchDisable(r.Context(), b.Codes)
+	response.OK(w, results)
+}
+
+func (h *URLHandler) BatchRemark(w http.ResponseWriter, r *http.Request) {
+	type body struct {
+		Remarks map[string]string `json:"remarks"`
+	}
+	var b body
+	if err := DecodeJSON(r, &b); err != nil {
+		response.BadRequest(w, err.Error())
+		return
+	}
+	if len(b.Remarks) == 0 {
+		response.BadRequest(w, "remarks is required and non-empty")
+		return
+	}
+	results := h.svc.BatchUpdateRemark(r.Context(), "", b.Remarks)
+	response.OK(w, results)
+}
+
+func (h *URLHandler) Workout(w http.ResponseWriter, r *http.Request) {
+	type body struct {
+		Code       string `json:"code"`
+		VisitN     int    `json:"visit_n"`
+		DisableGap int    `json:"disable_gap"`
+	}
+	var b body
+	if err := DecodeJSON(r, &b); err != nil {
+		response.BadRequest(w, err.Error())
+		return
+	}
+	if err := model.ValidateCode(b.Code); err != nil {
+		response.BadRequest(w, err.Error())
+		return
+	}
+	err := h.svc.ConcurrentWorkout(r.Context(), service.ConcurrentWorkoutCfg{
+		Code:       b.Code,
+		VisitN:     b.VisitN,
+		DisableGap: b.DisableGap,
+	})
+	if err != nil {
+		httperr.Map(w, err)
+		return
+	}
+	response.OK(w, map[string]string{"code": b.Code, "status": "workout done"})
 }
