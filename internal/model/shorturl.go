@@ -6,6 +6,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"shurl/pkg/validator"
 )
 
 // ShortURL 表示一条短链接映射记录。
@@ -132,11 +134,17 @@ func ValidateRawURL(raw string) error {
 type CreateReq struct {
 	RawURL     string        `json:"raw_url"`
 	CustomCode string        `json:"custom_code,omitempty"`
-	TTL        time.Duration `json:"ttl,omitempty"`     // 有效期（相对时长，与 ExpireAt 二选一）
+	TTL        time.Duration `json:"ttl,omitempty"`        // 有效期（相对时长，与 ExpireAt 二选一）
+	TTLString  string        `json:"ttl_string,omitempty"` // 字符串形式的 TTL，优先级高于 TTL（若同时提供）
 	ExpireAt   time.Time     `json:"expire_at,omitempty"`
 	MaxVisits  int64         `json:"max_visits,omitempty"`
 	Remark     string        `json:"remark,omitempty"`
 }
+
+const (
+	ttlMinRange = 1 * time.Second
+	ttlMaxRange = 10 * 365 * 24 * time.Hour
+)
 
 // Validate 校验 CreateReq 字段。
 func (r *CreateReq) Validate() error {
@@ -151,6 +159,11 @@ func (r *CreateReq) Validate() error {
 			return err
 		}
 	}
+	ttlVal, err := resolveTTL(r.TTL, r.TTLString)
+	if err != nil {
+		return err
+	}
+	r.TTL = ttlVal
 	if r.TTL < 0 {
 		return errors.New("shorturl: ttl must be non-negative")
 	}
@@ -158,4 +171,41 @@ func (r *CreateReq) Validate() error {
 		return errors.New("shorturl: max_visits must be non-negative")
 	}
 	return nil
+}
+
+// resolveTTL 合并 time.Duration 与字符串形式的 TTL。
+// 规则：
+//   1) 若 TTLString 非空，优先按字符串解析（支持 1y、[1d]、300 等宽松写法）；
+//   2) 解析成功后若数值 TTL 也非零，取二者较大值（便于不同来源兜底）；
+//   3) 解析结果要落在 [1s, 10y] 范围内，避免明显离谱的输入漏过。
+func resolveTTL(durationTTL time.Duration, rawTTL string) (time.Duration, error) {
+	var parsed time.Duration
+	var hasParsed bool
+	if rawTTL != "" {
+		normalized := validator.NormalizeDurationInput(rawTTL)
+		if normalized != rawTTL {
+			rawTTL = normalized
+		}
+		p, err := validator.ValidateTTLString(rawTTL)
+		if err != nil {
+			return 0, errors.New("shorturl: invalid ttl_string: " + err.Error())
+		}
+		parsed = p
+		hasParsed = true
+	}
+	chosen := durationTTL
+	if hasParsed {
+		if parsed > chosen {
+			chosen = parsed
+		} else if chosen == 0 {
+			chosen = parsed
+		}
+	}
+	if err := validator.TTLInRange(chosen, ttlMinRange, ttlMaxRange, "ttl"); err != nil {
+		if chosen == 0 {
+			return 0, nil
+		}
+		return 0, errors.New("shorturl: ttl out of range: " + err.Error())
+	}
+	return chosen, nil
 }

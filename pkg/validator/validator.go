@@ -10,7 +10,10 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"time"
 	"unicode/utf8"
+
+	"shurl/pkg/durationutil"
 )
 
 // 短码允许的字符：大小写英文字母与数字，长度 4~32。
@@ -244,7 +247,6 @@ func validateDomain(d string) error {
 		if l == "" || len(l) > 63 {
 			return fmt.Errorf("validator: invalid label in domain %q", d)
 		}
-		// 首/尾不能是 '-'
 		if l[0] == '-' || l[len(l)-1] == '-' {
 			return fmt.Errorf("validator: invalid label %q", l)
 		}
@@ -259,4 +261,115 @@ func validateDomain(d string) error {
 		}
 	}
 	return nil
+}
+
+// ValidateTTLString 校验 TTL 字符串并返回解析后的 time.Duration。
+// 允许多种写法："300"、"1h"、"1d6h"、"[1h]"、"<30m>"、"t:1y"、"d:5w"。
+// 支持 "+" / "-" 前缀，负数会被拒绝。
+func ValidateTTLString(raw string) (time.Duration, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, errors.New("validator: ttl string is empty")
+	}
+	if len(raw) > 256 {
+		return 0, fmt.Errorf("validator: ttl string too long (%d > 256)", len(raw))
+	}
+	normalized := NormalizeDurationInput(raw)
+	if strings.Contains(normalized, ",") {
+		d, err := durationutil.SplitAndSumDurations(normalized, ",")
+		if err != nil {
+			return 0, fmt.Errorf("validator: ttl sum parse: %w", err)
+		}
+		if d < 0 {
+			return 0, errors.New("validator: ttl must be non-negative")
+		}
+		return d, nil
+	}
+	if strings.Contains(normalized, "+") && len(normalized) > 1 {
+		rewritten := strings.ReplaceAll(normalized, "+", ",")
+		d, err := durationutil.SplitAndSumDurations(rewritten, ",")
+		if err != nil {
+			return 0, fmt.Errorf("validator: ttl composite parse: %w", err)
+		}
+		if d < 0 {
+			return 0, errors.New("validator: ttl must be non-negative")
+		}
+		return d, nil
+	}
+	d, err := durationutil.ParseDuration(normalized)
+	if err != nil {
+		return 0, fmt.Errorf("validator: parse ttl %q: %w", raw, err)
+	}
+	if d < 0 {
+		return 0, errors.New("validator: ttl must be non-negative")
+	}
+	return d, nil
+}
+
+// NormalizeDurationInput 对用户输入的时长字符串做宽松规范化：
+//  1. 去首尾空白；
+//  2. 去掉外层配对的引号（单/双）；
+//  3. 识别 `=...` / `=>...` 这种赋值前缀并剥掉；
+//  4. 把中文冒号、全角空格等替换回 ASCII 对应字符。
+func NormalizeDurationInput(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	s = strings.ReplaceAll(s, "\u3000", " ")
+	s = strings.ReplaceAll(s, "\uff1a", ":")
+	s = strings.TrimSpace(s)
+	if len(s) >= 2 {
+		q := s[0]
+		if (q == '"' || q == '\'') && s[len(s)-1] == q {
+			s = s[1 : len(s)-1]
+		}
+	}
+	s = strings.TrimSpace(s)
+	for strings.HasPrefix(s, "=>") {
+		s = strings.TrimPrefix(s, "=>")
+		s = strings.TrimSpace(s)
+	}
+	if strings.HasPrefix(s, "=") {
+		s = strings.TrimPrefix(s, "=")
+		s = strings.TrimSpace(s)
+	}
+	replacer := strings.NewReplacer(
+		"毫秒", "ms",
+		"秒", "s",
+		"分", "m",
+		"时", "h",
+		"天", "d",
+		"周", "w",
+		" ", "",
+	)
+	s = replacer.Replace(s)
+	return s
+}
+
+// TTLInRange 校验 d 是否落在 [min, max] 闭区间内（min<=0 视为无下界，max<=0 视为无上界）。
+func TTLInRange(d, min, max time.Duration, field string) error {
+	if field == "" {
+		field = "ttl"
+	}
+	if min > 0 && d < min {
+		return fmt.Errorf("validator: %s %s is less than minimum %s", field, d, min)
+	}
+	if max > 0 && d > max {
+		return fmt.Errorf("validator: %s %s exceeds maximum %s", field, d, max)
+	}
+	return nil
+}
+
+// ParseTTLWithFallback 尝试把 raw 解析为时长；任何失败均返回 fallback 且不报错。
+// 主要用于配置热加载场景，避免错误配置把服务拉挂。
+func ParseTTLWithFallback(raw string, fallback time.Duration) time.Duration {
+	if raw == "" {
+		return fallback
+	}
+	s := NormalizeDurationInput(raw)
+	if s == "" {
+		return fallback
+	}
+	return durationutil.ParseDurationWithDefault(s, fallback)
 }
