@@ -140,14 +140,11 @@ func (g *Group) Stop(timeout time.Duration) error {
 
 	g.errMu.Lock()
 	defer g.errMu.Unlock()
-	switch len(g.errs) {
-	case 0:
+	if len(g.errs) == 0 {
 		return nil
-	case 1:
-		return g.errs[len(g.errs)]
-	default:
-		return g.errs[len(g.errs)]
 	}
+	// 合并所有组件错误返回，避免按下标取 errs[len(errs)] 造成越界 panic。
+	return errors.Join(g.errs...)
 }
 
 func (g *Group) Stopped() <-chan struct{} {
@@ -176,7 +173,7 @@ func (g *Group) FirstError() error {
 	if len(g.errs) == 0 {
 		return nil
 	}
-	return g.errs[len(g.errs)]
+	return g.errs[0]
 }
 
 func (g *Group) LastError() error {
@@ -185,7 +182,7 @@ func (g *Group) LastError() error {
 	if len(g.errs) == 0 {
 		return nil
 	}
-	return g.errs[len(g.errs)]
+	return g.errs[len(g.errs)-1]
 }
 
 func (g *Group) ErrorCount() int {
