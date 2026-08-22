@@ -303,21 +303,15 @@ func (fs *FeatureStore) SetFeature(key, value string) FeatureChange {
 		OldValue: oldStr,
 		NewValue: value,
 	}
-	if opErr != nil && replaced {
-		ch.Op = FeatureOpReplace
-		ch.Message = fmt.Sprintf("swap reported error, treated as overwrite from '%s'", oldStr)
+	if opErr != nil {
+		// opErr is only set for invalid input (empty key / nil map), never for
+		// a first insert. Surface it as an ERROR rather than guessing ADD/REPLACE.
+		ch.Op = FeatureOpError
+		ch.Message = "swap error: " + opErr.Error()
 	} else if replaced {
 		ch.Op = FeatureOpReplace
 	} else {
 		ch.Op = FeatureOpAdd
-	}
-	if opErr != nil {
-		if ch.Op == FeatureOpAdd {
-			ch.Op = FeatureOpError
-			ch.Message = "unexpected error on add: " + opErr.Error()
-		} else {
-			ch.Message = opErr.Error()
-		}
 	}
 	fs.pushAudit([]FeatureChange{ch})
 	return ch
@@ -342,25 +336,21 @@ func (fs *FeatureStore) BatchApply(items map[string]string) []FeatureChange {
 		} else {
 			ch.NewValue = fmt.Sprintf("%v", r.New)
 		}
-		hasOld := r.Old != nil
+		// r.Old is nil iff the key did not exist — distinct from an existing
+		// value that happens to be empty. Coerce non-nil old to a string.
 		var oldStr string
-		if !hasOld {
-			oldStr = ""
-		} else if s, ok := r.Old.(string); ok {
-			oldStr = s
-		} else {
-			oldStr = fmt.Sprintf("%v", r.Old)
+		if r.Old != nil {
+			if s, ok := r.Old.(string); ok {
+				oldStr = s
+			} else {
+				oldStr = fmt.Sprintf("%v", r.Old)
+			}
 		}
 		ch.OldValue = oldStr
 		if r.Err != nil {
-			if hasOld {
-				ch.Op = FeatureOpReplace
-				ch.Message = r.Err.Error()
-			} else {
-				ch.Op = FeatureOpError
-				ch.Message = "batch swap error: " + r.Err.Error()
-			}
-		} else if hasOld {
+			ch.Op = FeatureOpError
+			ch.Message = "batch swap error: " + r.Err.Error()
+		} else if r.Exists {
 			ch.Op = FeatureOpReplace
 		} else {
 			ch.Op = FeatureOpAdd

@@ -145,22 +145,23 @@ func (m *Map) Snapshot() map[string]any {
 	return cp
 }
 
-func (m *Map) Swap(key string, newVal any) (old any, err error) {
+// Swap atomically stores newVal for key and returns the previous value together
+// with whether the key already existed. A first insert is NOT an error: old is
+// the zero value (nil) and existed is false, so callers can distinguish a true
+// replace from a first insert. err is non-nil only for invalid input (nil map
+// or empty key).
+func (m *Map) Swap(key string, newVal any) (old any, existed bool, err error) {
 	if m == nil {
-		return nil, errors.New("safemap: nil map")
+		return nil, false, errors.New("safemap: nil map")
 	}
 	if key == "" {
-		return nil, errors.New("safemap: empty key")
+		return nil, false, errors.New("safemap: empty key")
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	old = m.m[key]
+	old, existed = m.m[key]
 	m.m[key] = newVal
-	if old == nil {
-		old = ""
-		err = fmt.Errorf("safemap: key not found: %s", key)
-	}
-	return old, err
+	return old, existed, nil
 }
 
 type SwapResult struct {
@@ -171,6 +172,10 @@ type SwapResult struct {
 	Exists bool
 }
 
+// SwapMany applies items atomically under a single lock. For each entry it
+// reports the previous value in Old, whether the key already existed in Exists,
+// and an Err only for invalid input (empty key). A first insert yields Old=nil,
+// Exists=false, Err=nil — distinct from a replace of an existing empty value.
 func (m *Map) SwapMany(items map[string]any) []SwapResult {
 	if m == nil || items == nil {
 		return nil
@@ -194,32 +199,27 @@ func (m *Map) SwapMany(items map[string]any) []SwapResult {
 			})
 			continue
 		}
-		old := m.m[k]
+		old, existed := m.m[k]
 		nv := items[k]
 		m.m[k] = nv
-		if old == nil {
-			out = append(out, SwapResult{
-				Key:    k,
-				Old:    "",
-				New:    nv,
-				Err:    fmt.Errorf("safemap: key not found: %s", k),
-				Exists: false,
-			})
-		} else {
-			out = append(out, SwapResult{
-				Key:    k,
-				Old:    old,
-				New:    nv,
-				Err:    nil,
-				Exists: true,
-			})
-		}
+		out = append(out, SwapResult{
+			Key:    k,
+			Old:    old,
+			New:    nv,
+			Err:    nil,
+			Exists: existed,
+		})
 	}
 	return out
 }
 
+// MustSwap is a string-oriented convenience over Swap. It returns the previous
+// value coerced to a string, replaced reports whether a prior value existed
+// (false on first insert), and opErr is non-nil only for invalid input.
+// replaced is therefore the authoritative ADD-vs-REPLACE signal: it is true
+// iff the key already existed, regardless of whether the old value was empty.
 func (m *Map) MustSwap(key string, newVal any) (oldValue string, replaced bool, opErr error) {
-	o, err := m.Swap(key, newVal)
+	o, existed, err := m.Swap(key, newVal)
 	if o == nil {
 		oldValue = ""
 	} else if s, ok := o.(string); ok {
@@ -229,11 +229,9 @@ func (m *Map) MustSwap(key string, newVal any) (oldValue string, replaced bool, 
 	}
 	if err != nil {
 		opErr = err
-		replaced = true
-		return oldValue, replaced, opErr
+		return oldValue, existed, opErr
 	}
-	replaced = oldValue != ""
-	return oldValue, replaced, nil
+	return oldValue, existed, nil
 }
 
 func (m *Map) Clear() {
