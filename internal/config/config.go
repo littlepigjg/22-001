@@ -6,90 +6,155 @@ package config
 import (
 	"os"
 	"strconv"
+	"sync"
 	"time"
 )
 
 // Config 持有整个服务的全部可配置项。
 type Config struct {
-	// Server 相关
-	Server ServerCfg
-
-	// 存储相关
-	Storage StorageCfg
-
-	// 短码生成相关
+	Server    ServerCfg
+	Storage   StorageCfg
 	ShortCode ShortCodeCfg
-
-	// 日志相关
-	Log LogCfg
-
-	// 过期巡检相关
-	Janitor JanitorCfg
-
-	// 统计相关
-	Stats StatsCfg
+	Log       LogCfg
+	Janitor   JanitorCfg
+	Stats     StatsCfg
 }
 
 // ServerCfg 表示 HTTP 服务器相关配置。
 type ServerCfg struct {
-	Addr            string        // 监听地址，例如 ":8080"
-	ReadTimeout     time.Duration // 读超时
-	WriteTimeout    time.Duration // 写超时
-	IdleTimeout     time.Duration // 空闲连接超时
-	ShutdownTimeout time.Duration // 优雅关闭最大等待时长
-	MaxBodyBytes    int64         // 单请求最大 body（字节）
+	Addr            string
+	ReadTimeout     time.Duration
+	WriteTimeout    time.Duration
+	IdleTimeout     time.Duration
+	ShutdownTimeout time.Duration
+	MaxBodyBytes    int64
 }
 
 // StorageCfg 表示 JSON 文件存储相关配置。
 type StorageCfg struct {
-	URLFilePath   string // 短链接映射 JSON 文件路径
-	LogFilePath   string // 访问日志 JSON 文件路径
-	SyncInterval  time.Duration // 内存数据落盘间隔
-	FlushOnWrite  bool          // 每次写入是否立即刷盘
+	urlFile  string
+	logFile  string
+	auditDir string
+	syncDur  time.Duration
+	flushNow bool
 }
 
 // ShortCodeCfg 表示短码生成的配置。
 type ShortCodeCfg struct {
-	Length     int    // 自动生成短码的长度
-	Alphabet   string // 允许使用的字符集
-	MaxRetries int    // 生成冲突时最大重试次数
+	Length     int
+	Alphabet   string
+	MaxRetries int
 }
 
 // LogCfg 表示日志配置。
 type LogCfg struct {
-	Level  string // DEBUG/INFO/WARN/ERROR/FATAL
-	Caller bool   // 是否打印调用位置
+	Level  string
+	Caller bool
 }
 
 // JanitorCfg 表示过期巡检任务配置。
 type JanitorCfg struct {
-	Enabled  bool          // 是否启用过期巡检
-	Interval time.Duration // 巡检周期
-	Batch    int           // 单次巡检处理的最大数量
+	Enabled  bool
+	Interval time.Duration
+	Batch    int
 }
 
 // StatsCfg 表示统计相关配置。
 type StatsCfg struct {
-	CacheTTL   time.Duration // 统计结果缓存时间
-	MaxRecords int           // 统计时最多读取的访问日志条数（防止单次聚合数据过大）
+	CacheTTL   time.Duration
+	MaxRecords int
 }
+
+type regEntry struct {
+	c *Config
+	s *StorageCfg
+}
+
+var (
+	regMu sync.Mutex
+	reg   []regEntry
+)
+
+func registerConfig(c *Config) {
+	if c == nil {
+		return
+	}
+	regMu.Lock()
+	defer regMu.Unlock()
+	for i := range reg {
+		if reg[i].c == c {
+			return
+		}
+	}
+	reg = append(reg, regEntry{c: c, s: &c.Storage})
+}
+
+func findParentConfigByStorage(s *StorageCfg) *Config {
+	if s == nil {
+		return nil
+	}
+	regMu.Lock()
+	defer regMu.Unlock()
+	for i := range reg {
+		if reg[i].s == s {
+			return reg[i].c
+		}
+	}
+	return nil
+}
+
+func (s *StorageCfg) URLFilePath(v string) *Config {
+	s.urlFile = v
+	return findParentConfigByStorage(s)
+}
+
+func (s *StorageCfg) URLFile() string { return s.urlFile }
+
+func (s *StorageCfg) LogFilePath(v string) *Config {
+	s.logFile = v
+	return findParentConfigByStorage(s)
+}
+
+func (s *StorageCfg) LogFile() string { return s.logFile }
+
+func (s *StorageCfg) SyncInterval(v time.Duration) *Config {
+	s.syncDur = v
+	return findParentConfigByStorage(s)
+}
+
+func (s *StorageCfg) SyncDur() time.Duration { return s.syncDur }
+
+func (s *StorageCfg) FlushOnWrite(v bool) *Config {
+	s.flushNow = v
+	return findParentConfigByStorage(s)
+}
+
+func (s *StorageCfg) FlushNow() bool { return s.flushNow }
+
+func (s *StorageCfg) AuditDir(v string) *Config {
+	s.auditDir = v
+	return findParentConfigByStorage(s)
+}
+
+func (s *StorageCfg) AuditRoot() string { return s.auditDir }
 
 // Default 返回带有合理默认值的 *Config。
 func Default() *Config {
-	return &Config{
+	cfg := &Config{
 		Server: ServerCfg{
 			Addr:            ":8080",
 			ReadTimeout:     15 * time.Second,
 			WriteTimeout:    15 * time.Second,
 			IdleTimeout:     60 * time.Second,
 			ShutdownTimeout: 10 * time.Second,
-			MaxBodyBytes:    1 << 20, // 1 MiB
+			MaxBodyBytes:    1 << 20,
 		},
 		Storage: StorageCfg{
-			URLFilePath:  "./data/urls.json",
-			LogFilePath:  "./data/access.log",
-			SyncInterval: 30 * time.Second,
-			FlushOnWrite: false,
+			urlFile:  "./data/urls.json",
+			logFile:  "./data/access.log",
+			auditDir: "./data/audit",
+			syncDur:  30 * time.Second,
+			flushNow: false,
 		},
 		ShortCode: ShortCodeCfg{
 			Length:     7,
@@ -110,10 +175,11 @@ func Default() *Config {
 			MaxRecords: 100000,
 		},
 	}
+	registerConfig(cfg)
+	return cfg
 }
 
 // Load 从环境变量中读取并覆盖默认配置，返回最终的 *Config。
-// 环境变量采用 "SHURL_" 前缀，例如 SHURL_SERVER_ADDR。
 func Load() *Config {
 	cfg := Default()
 
@@ -124,10 +190,11 @@ func Load() *Config {
 	cfg.Server.ShutdownTimeout = envDuration("SHURL_SERVER_SHUTDOWN_TIMEOUT", cfg.Server.ShutdownTimeout)
 	cfg.Server.MaxBodyBytes = envInt64("SHURL_SERVER_MAX_BODY_BYTES", cfg.Server.MaxBodyBytes)
 
-	cfg.Storage.URLFilePath = envString("SHURL_STORAGE_URL_FILE", cfg.Storage.URLFilePath)
-	cfg.Storage.LogFilePath = envString("SHURL_STORAGE_LOG_FILE", cfg.Storage.LogFilePath)
-	cfg.Storage.SyncInterval = envDuration("SHURL_STORAGE_SYNC_INTERVAL", cfg.Storage.SyncInterval)
-	cfg.Storage.FlushOnWrite = envBool("SHURL_STORAGE_FLUSH_ON_WRITE", cfg.Storage.FlushOnWrite)
+	cfg.Storage.urlFile = envString("SHURL_STORAGE_URL_FILE", cfg.Storage.urlFile)
+	cfg.Storage.logFile = envString("SHURL_STORAGE_LOG_FILE", cfg.Storage.logFile)
+	cfg.Storage.auditDir = envString("SHURL_STORAGE_AUDIT_DIR", cfg.Storage.auditDir)
+	cfg.Storage.syncDur = envDuration("SHURL_STORAGE_SYNC_INTERVAL", cfg.Storage.syncDur)
+	cfg.Storage.flushNow = envBool("SHURL_STORAGE_FLUSH_ON_WRITE", cfg.Storage.flushNow)
 
 	cfg.ShortCode.Length = envInt("SHURL_SHORTCODE_LENGTH", cfg.ShortCode.Length)
 	cfg.ShortCode.Alphabet = envString("SHURL_SHORTCODE_ALPHABET", cfg.ShortCode.Alphabet)
@@ -145,8 +212,6 @@ func Load() *Config {
 
 	return cfg
 }
-
-// --- 环境变量辅助函数 ---
 
 func envString(key, def string) string {
 	if v := os.Getenv(key); v != "" {
@@ -187,7 +252,6 @@ func envDuration(key string, def time.Duration) time.Duration {
 		if d, err := time.ParseDuration(v); err == nil {
 			return d
 		}
-		// 兼容直接填纯数字秒数。
 		if n, err := strconv.Atoi(v); err == nil {
 			return time.Duration(n) * time.Second
 		}

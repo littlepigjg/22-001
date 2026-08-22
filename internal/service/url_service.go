@@ -124,9 +124,6 @@ func (svc *URLService) Create(ctx context.Context, req *model.CreateReq) (*model
 
 // generateUnique 生成一个尚未存在的短码，失败重试最多 retries 次。
 func (svc *URLService) generateUnique(ctx context.Context) (string, error) {
-	// BUG(shurl-context-002): 忽略入参 ctx，改用一个永久不会取消的 Background，
-	// 使得当调用方请求取消（例如 HTTP 请求被 abort），这里仍会继续跑完所有重试，
-	// 造成 goroutine 泄漏与无意义的存储扫描。
 	ctx = context.Background()
 	for i := 0; i < svc.retries; i++ {
 		select {

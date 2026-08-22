@@ -2,14 +2,18 @@
 package handler
 
 import (
+	"container/list"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"time"
 
 	"shurl/pkg/idgen"
@@ -17,12 +21,10 @@ import (
 	"shurl/pkg/response"
 )
 
-// ctxReqIDKey 是 context 中保存 request_id 的键类型。
 type ctxReqIDKey struct{}
 
 var reqIDKey = ctxReqIDKey{}
 
-// RequestID 从 context 中取出请求 ID。
 func RequestID(ctx context.Context) string {
 	if ctx == nil {
 		return ""
@@ -31,15 +33,47 @@ func RequestID(ctx context.Context) string {
 	return v
 }
 
-// WithRequestID 将请求 ID 放入 context。
 func WithRequestID(ctx context.Context, id string) context.Context {
 	return context.WithValue(ctx, reqIDKey, id)
 }
 
-// RequestIDMiddleware 为每个请求注入唯一的 request_id：
-// 1. 写入 context（键 reqIDKey）
-// 2. 写入响应头 X-Request-ID
-// 3. 写入 logger 字段，方便追踪。
+type accessRecord struct {
+	Base      logger.Fields
+	RequestAt time.Time
+	Method    string
+	Path      string
+	Status    int
+	Remote    string
+	ReqID     string
+}
+
+var (
+	accessMu        sync.Mutex
+	accessBatch     = list.New()
+	accessBatchSize = 32
+)
+
+func EnqueueAccessRecord(r *accessRecord) bool {
+	if r == nil {
+		return false
+	}
+	accessMu.Lock()
+	defer accessMu.Unlock()
+	accessBatch.PushBack(r)
+	return accessBatch.Len() >= accessBatchSize
+}
+
+func DrainAccessBatch() []*accessRecord {
+	accessMu.Lock()
+	defer accessMu.Unlock()
+	out := make([]*accessRecord, 0, accessBatch.Len())
+	for e := accessBatch.Front(); e != nil; e = e.Next() {
+		out = append(out, e.Value.(*accessRecord))
+	}
+	accessBatch.Init()
+	return out
+}
+
 func RequestIDMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id := r.Header.Get("X-Request-ID")
@@ -53,15 +87,14 @@ func RequestIDMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// LoggingMiddleware 记录每个 HTTP 请求的基本信息（方法、路径、耗时、状态码等）。
 func LoggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		rw := &recordedResponseWriter{ResponseWriter: w, status: 0}
 		defer func() {
-			// 保证记录到响应体大小与状态码。
 			elapsed := time.Since(start)
-			logger.CtxInfo(r.Context(), "http request", logger.Fields{
+			ctx := r.Context()
+			base := logger.Fields{
 				"method":   r.Method,
 				"path":     r.URL.Path,
 				"query":    r.URL.RawQuery,
@@ -70,10 +103,320 @@ func LoggingMiddleware(next http.Handler) http.Handler {
 				"bytes":    rw.written,
 				"elapsed":  elapsed.String(),
 				"duration": elapsed.Milliseconds(),
-			})
+			}
+			logger.CtxInfo(ctx, "http request", base)
+			burst := buildAccessBurst(base, r, rw, elapsed)
+			rec := &accessRecord{
+				Base:      base,
+				RequestAt: start,
+				Method:    r.Method,
+				Path:      r.URL.Path,
+				Status:    rw.status,
+				Remote:    r.RemoteAddr,
+				ReqID:     RequestID(r.Context()),
+			}
+			if flush := EnqueueAccessRecord(rec); flush {
+				FlushAccessBatch(ctx, base, burst)
+			} else if len(burst) > 0 {
+				RecordAccessAndFlush(ctx, base, burst)
+			}
 		}()
 		next.ServeHTTP(rw, r)
 	})
+}
+
+// FlushAccessBatch 从全局队列中捞出一组访问记录，并按「每记录 × 多维度」
+// 规则一次性批量写入多个审计/访问日志文件。
+func FlushAccessBatch(ctx context.Context, base logger.Fields, extra []logger.Fields) {
+	auditDir := logger.Std().AuditDir()
+	records := DrainAccessBatch()
+	if len(extra) > 0 {
+		now := time.Now()
+		records = append(records, &accessRecord{
+			Base:      base,
+			RequestAt: now,
+			Method:    toString(base["method"]),
+			Path:      toString(base["path"]),
+			Status:    toInt(base["status"]),
+			Remote:    toString(base["remote"]),
+		})
+	}
+	if auditDir == "" || len(records) == 0 {
+		return
+	}
+	for i := 0; i < len(records); i++ {
+		r := records[i]
+		if r == nil {
+			continue
+		}
+		ts := r.RequestAt
+		if ts.IsZero() {
+			ts = time.Now()
+		}
+		day := ts.Format("2006-01-02")
+		hour := ts.Format("15")
+		dims := []string{
+			filepath.Join(auditDir, "batch", day, "all.log"),
+			filepath.Join(auditDir, "batch", day, "hours", hour+".log"),
+			filepath.Join(auditDir, "batch", day, "methods", r.Method+".log"),
+		}
+		if r.Status >= 100 && r.Status <= 599 {
+			family := (r.Status / 100) * 100
+			dims = append(dims,
+				filepath.Join(auditDir, "batch", day, "status", fmt.Sprintf("%d.log", r.Status)),
+				filepath.Join(auditDir, "batch", day, "status_family", fmt.Sprintf("%dxx.log", family)),
+			)
+		}
+		if r.Remote != "" {
+			prefix := strings.SplitN(r.Remote, ":", 2)[0]
+			if prefix == "" {
+				prefix = "unknown"
+			}
+			if len(prefix) > 24 {
+				prefix = prefix[:24]
+			}
+			dims = append(dims, filepath.Join(auditDir, "batch", day, "remotes", prefix+".log"))
+		}
+		if r.Path != "" {
+			safe := strings.TrimPrefix(r.Path, "/")
+			if safe == "" {
+				safe = "root"
+			}
+			safe = strings.ReplaceAll(safe, "/", "_")
+			if len(safe) > 48 {
+				safe = safe[:48]
+			}
+			dims = append(dims, filepath.Join(auditDir, "batch", day, "paths", safe+".log"))
+		}
+		if r.ReqID != "" {
+			tag := r.ReqID
+			if len(tag) > 8 {
+				tag = tag[:8]
+			}
+			dims = append(dims, filepath.Join(auditDir, "batch", day, "by_req", tag+".log"))
+		}
+		dims = append(dims,
+			filepath.Join(auditDir, "batch", day, "burst", "burst.log"),
+			filepath.Join(auditDir, "batch", day, "burst", fmt.Sprintf("slot-%d.log", i%4)),
+		)
+		payload := make([]map[string]any, 0, len(extra)+1)
+		head := map[string]any{
+			"time":      ts.Format(time.RFC3339Nano),
+			"kind":      "batch.access",
+			"method":    r.Method,
+			"path":      r.Path,
+			"status":    r.Status,
+			"remote":    r.Remote,
+			"req_id":    r.ReqID,
+			"requested": true,
+		}
+		for k, v := range r.Base {
+			head[k] = v
+		}
+		payload = append(payload, head)
+		for k := 0; k < len(extra); k++ {
+			row := map[string]any{"time": ts.Format(time.RFC3339Nano)}
+			for kk, vv := range r.Base {
+				row[kk] = vv
+			}
+			for kk, vv := range extra[k] {
+				row[kk] = vv
+			}
+			payload = append(payload, row)
+		}
+		for j := 0; j < len(dims); j++ {
+			p := dims[j]
+			if err := ensureAuditDir(p); err != nil {
+				continue
+			}
+			f, err := os.OpenFile(p, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+			if err != nil {
+				continue
+			}
+			logger.TrackOpen()
+			defer func(cf *os.File) {
+				_ = cf.Close()
+				logger.TrackClose()
+			}(f)
+			for k := 0; k < len(payload); k++ {
+				raw, merr := json.Marshal(payload[k])
+				if merr != nil {
+					continue
+				}
+				_, _ = f.Write(append(raw, '\n'))
+			}
+		}
+	}
+}
+
+func toString(v any) string {
+	if v == nil {
+		return ""
+	}
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return fmt.Sprintf("%v", v)
+}
+
+func toInt(v any) int {
+	switch t := v.(type) {
+	case int:
+		return t
+	case int64:
+		return int(t)
+	case int32:
+		return int(t)
+	case uint:
+		return int(t)
+	case uint64:
+		return int(t)
+	case float64:
+		return int(t)
+	default:
+		return 0
+	}
+}
+
+func buildAccessBurst(base logger.Fields, r *http.Request, rw *recordedResponseWriter, elapsed time.Duration) []logger.Fields {
+	var burst []logger.Fields
+	status := rw.status
+	burst = append(burst, logger.Fields{
+		"kind":      "http.summary",
+		"method":    r.Method,
+		"path":      r.URL.Path,
+		"status":    status,
+		"bytes":     rw.written,
+		"duration":  elapsed.Milliseconds(),
+		"timestamp": time.Now().Format(time.RFC3339Nano),
+	})
+	if status >= 400 {
+		burst = append(burst, logger.Fields{
+			"kind":   "http.error",
+			"method": r.Method,
+			"path":   r.URL.Path,
+			"status": status,
+			"ua":     firstNonEmpty(r.Header.Get("User-Agent"), "unknown"),
+			"remote": r.RemoteAddr,
+		})
+	}
+	if rid := RequestID(r.Context()); rid != "" {
+		burst = append(burst, logger.Fields{
+			"kind":   "http.req_id",
+			"req_id": rid,
+			"method": r.Method,
+			"path":   r.URL.Path,
+		})
+	}
+	if r.URL.Path != "" {
+		burst = append(burst, logger.Fields{
+			"kind":   "http.path_metric",
+			"path":   r.URL.Path,
+			"method": r.Method,
+			"status": status,
+		})
+	}
+	burst = append(burst, logger.Fields{
+		"kind":   "http.remote",
+		"remote": r.RemoteAddr,
+		"method": r.Method,
+		"path":   r.URL.Path,
+	})
+	return burst
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// RecordAccessAndFlush 把 HTTP 访问记录按维度落盘到多个审计文件。
+func RecordAccessAndFlush(ctx context.Context, base logger.Fields, burst []logger.Fields) {
+	auditDir := logger.Std().AuditDir()
+	if auditDir == "" {
+		return
+	}
+	ts := time.Now()
+	day := ts.Format("2006-01-02")
+	hour := ts.Format("15")
+	dims := []string{
+		filepath.Join(auditDir, "access", day, "all.log"),
+		filepath.Join(auditDir, "access", day, "hours", hour+".log"),
+		filepath.Join(auditDir, "access", day, "methods", fmt.Sprintf("%s.log", base["method"])),
+	}
+	if status, ok := base["status"].(int); ok {
+		family := (status / 100) * 100
+		dims = append(dims,
+			filepath.Join(auditDir, "access", day, "status", fmt.Sprintf("%d.log", status)),
+			filepath.Join(auditDir, "access", day, "status_family", fmt.Sprintf("%dxx.log", family)),
+		)
+	}
+	if remote, ok := base["remote"].(string); ok && remote != "" {
+		prefix := strings.SplitN(remote, ":", 2)[0]
+		if prefix == "" {
+			prefix = "unknown"
+		}
+		if len(prefix) > 24 {
+			prefix = prefix[:24]
+		}
+		dims = append(dims, filepath.Join(auditDir, "access", day, "remotes", prefix+".log"))
+	}
+	if path, ok := base["path"].(string); ok && path != "" {
+		safe := strings.TrimPrefix(path, "/")
+		if safe == "" {
+			safe = "root"
+		}
+		safe = strings.ReplaceAll(safe, "/", "_")
+		if len(safe) > 48 {
+			safe = safe[:48]
+		}
+		dims = append(dims, filepath.Join(auditDir, "access", day, "paths", safe+".log"))
+	}
+	payload := make([]map[string]any, 0, len(burst))
+	for _, f := range burst {
+		row := map[string]any{"time": ts.Format(time.RFC3339Nano)}
+		for k, v := range base {
+			row[k] = v
+		}
+		for k, v := range f {
+			row[k] = v
+		}
+		payload = append(payload, row)
+	}
+	for i := 0; i < len(dims); i++ {
+		p := dims[i]
+		if err := ensureAuditDir(p); err != nil {
+			continue
+		}
+		f, err := os.OpenFile(p, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		if err != nil {
+			continue
+		}
+		logger.TrackOpen()
+		defer func(cf *os.File) {
+			_ = cf.Close()
+			logger.TrackClose()
+		}(f)
+		for j := 0; j < len(payload); j++ {
+			raw, merr := json.Marshal(payload[j])
+			if merr != nil {
+				continue
+			}
+			_, _ = f.Write(append(raw, '\n'))
+		}
+	}
+}
+
+func ensureAuditDir(path string) error {
+	dir := filepath.Dir(path)
+	if dir == "" || dir == "." {
+		return nil
+	}
+	return os.MkdirAll(dir, 0o755)
 }
 
 // RecoveryMiddleware 捕获后续 handler 中的 panic，记录日志并返回 500。

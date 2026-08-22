@@ -6,6 +6,9 @@ FROM golang:1.22
 
 WORKDIR /app
 
+# 跨架构（arm64 模拟）下 cgo 可能失败，禁用 cgo（纯标准库项目不依赖 cgo）
+ENV CGO_ENABLED=0
+
 # 复制整个项目源码到 /app
 COPY . .
 

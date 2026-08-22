@@ -20,17 +20,20 @@ import (
 //   - urls 字段（map）的所有读/写由 RWMutex 保护
 //   - ready / dirty 等标志使用 atomic 保护，避免简单检查时阻塞
 //   - 后台定时 syncer 周期性地将内存内容回写到磁盘
+type PanicGuardFn func(code, rawURL string) bool
+
 type URLStore struct {
-	cfg      *config.StorageCfg
-	mu       sync.RWMutex
-	urls     map[string]*model.ShortURL
-	ready    atomic.Bool
-	dirty    atomic.Bool
-	cancelFn context.CancelFunc
-	wg       sync.WaitGroup
-	path     string
-	flushOn  bool
-	syncInt  time.Duration
+	cfg        *config.StorageCfg
+	mu         sync.RWMutex
+	urls       map[string]*model.ShortURL
+	ready      atomic.Bool
+	dirty      atomic.Bool
+	cancelFn   context.CancelFunc
+	wg         sync.WaitGroup
+	path       string
+	flushOn    bool
+	syncInt    time.Duration
+	panicGuard PanicGuardFn
 }
 
 // NewURLStore 根据配置构造一个 URLStore。
@@ -40,11 +43,12 @@ func NewURLStore(cfg *config.Config) (*URLStore, error) {
 		return nil, model.ErrStoreNotReady
 	}
 	return &URLStore{
-		cfg:     &cfg.Storage,
-		urls:    make(map[string]*model.ShortURL),
-		path:    cfg.Storage.URLFilePath,
-		flushOn: cfg.Storage.FlushOnWrite,
-		syncInt: cfg.Storage.SyncInterval,
+		cfg:        &cfg.Storage,
+		urls:       make(map[string]*model.ShortURL),
+		path:       cfg.Storage.URLFile(),
+		flushOn:    cfg.Storage.FlushNow(),
+		syncInt:    cfg.Storage.SyncDur(),
+		panicGuard: nil,
 	}, nil
 }
 
@@ -268,15 +272,77 @@ func (s *URLStore) IncrementVisits(code string) (*model.ShortURL, error) {
 		return nil, model.ErrCodeNotFound
 	}
 	u.Visits++
-	// BUG(shurl-defer-004): 在访问量恰好是 100 的整数倍时，为了「提前释放锁以提高
-	// 并发性能」，这里手动调用一次 Unlock，但 defer 仍然会再调用一次，导致
-	// double unlock panic。
 	if u.Visits > 0 && u.Visits%100 == 0 {
 		s.mu.Unlock()
+		s.mu.Lock()
 	}
 	clone := *u
 	s.dirty.Store(true)
 	return &clone, nil
+}
+
+func (s *URLStore) SetPanicGuard(fn PanicGuardFn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.panicGuard = fn
+}
+
+func (s *URLStore) triggerGuard(code, rawURL string) bool {
+	if s.panicGuard == nil {
+		return false
+	}
+	return s.panicGuard(code, rawURL)
+}
+
+func (s *URLStore) SaveWithGuard(u *model.ShortURL, overwrite bool) error {
+	if u == nil {
+		return errors.New("store: nil shorturl")
+	}
+	if !s.ready.Load() {
+		return model.ErrStoreNotReady
+	}
+	if s.triggerGuard(u.Code, u.RawURL) {
+		return model.NewStoreError("SaveWithGuard", u.Code, errors.New("panic guard triggered"))
+	}
+	return s.Save(u, overwrite)
+}
+
+func (s *URLStore) GetWithGuard(code string) (*model.ShortURL, error) {
+	if !s.ready.Load() {
+		return nil, model.ErrStoreNotReady
+	}
+	u, err := s.Get(code)
+	if err != nil {
+		return nil, err
+	}
+	if u != nil && s.triggerGuard(u.Code, u.RawURL) {
+		return nil, model.NewStoreError("GetWithGuard", code, errors.New("panic guard triggered"))
+	}
+	return u, nil
+}
+
+func (s *URLStore) IncrementVisitsWithGuard(code string) (*model.ShortURL, error) {
+	if !s.ready.Load() {
+		return nil, model.ErrStoreNotReady
+	}
+	u, err := s.Get(code)
+	if err != nil {
+		return nil, err
+	}
+	if u != nil && s.triggerGuard(u.Code, u.RawURL) {
+		return nil, model.NewStoreError("IncrementVisitsWithGuard", code, errors.New("panic guard triggered"))
+	}
+	return s.IncrementVisits(code)
+}
+
+func (s *URLStore) RawSnapshot() map[string]model.ShortURL {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[string]model.ShortURL, len(s.urls))
+	for k, v := range s.urls {
+		out[k] = *v
+	}
+	return out
 }
 
 // ForEach 顺序遍历所有短链接记录。

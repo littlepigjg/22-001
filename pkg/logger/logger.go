@@ -10,9 +10,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -72,11 +74,33 @@ var ctxFieldsKey = ctxKey{}
 
 // Logger 是一个线程安全的结构化日志记录器。
 type Logger struct {
-	mu       sync.Mutex
-	out      io.Writer
-	level    Level
-	caller   bool
-	prefixes Fields
+	mu           sync.Mutex
+	out          io.Writer
+	level        Level
+	caller       bool
+	prefixes     Fields
+	auditDir     string
+	auditEnabled bool
+	opened       atomic.Int64
+}
+
+var (
+	openCounter atomic.Int64
+	peakCounter atomic.Int64
+)
+
+func OpenFileCount() int64 { return openCounter.Load() }
+func PeakOpenHandles() int64 { return peakCounter.Load() }
+func ResetPeakHandles()      { peakCounter.Store(0) }
+
+func TrackOpen() {
+	if cur := openCounter.Add(1); cur > peakCounter.Load() {
+		peakCounter.Store(cur)
+	}
+}
+
+func TrackClose() {
+	openCounter.Add(-1)
 }
 
 // 全局默认 Logger。
@@ -94,6 +118,52 @@ func New(out io.Writer, level Level, caller bool) *Logger {
 		caller:   caller,
 		prefixes: Fields{},
 	}
+}
+
+func (l *Logger) OpenedHandles() int64 { return l.opened.Load() }
+
+func (l *Logger) SetAuditDir(dir string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if dir == "" {
+		l.auditEnabled = false
+		l.auditDir = ""
+		return
+	}
+	l.auditDir = dir
+	l.auditEnabled = true
+}
+
+func (l *Logger) AuditDir() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.auditDir
+}
+
+func (l *Logger) auditEnabledLocked() bool { return l.auditEnabled && l.auditDir != "" }
+
+func ensureDir(path string) error {
+	if path == "" {
+		return nil
+	}
+	dir := filepath.Dir(path)
+	if dir == "" || dir == "." {
+		return nil
+	}
+	return os.MkdirAll(dir, 0o755)
+}
+
+func (l *Logger) openAuditFile(path string) (*os.File, error) {
+	if err := ensureDir(path); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	l.opened.Add(1)
+	TrackOpen()
+	return f, nil
 }
 
 // Std 返回全局默认 Logger。
@@ -187,22 +257,18 @@ func (l *Logger) log(ctx context.Context, skip int, level Level, msg string, fie
 		entry["caller"] = callerInfo(skip + 1)
 	}
 
-	// 合并前缀字段。
 	for k, v := range l.prefixes {
 		entry[k] = v
 	}
-	// 合并 context 中的字段。
 	for k, v := range fieldsFromContext(ctx) {
 		entry[k] = v
 	}
-	// 合并调用时传入的字段（最后，可覆盖前面）。
 	for k, v := range fields {
 		entry[k] = v
 	}
 
 	data, err := json.Marshal(entry)
 	if err != nil {
-		// JSON 序列化失败时退化为 fmt 输出，保证日志不丢失。
 		fmt.Fprintf(l.out, "%s [%s] marshal error: %v raw=%v\n",
 			time.Now().Format(time.RFC3339), LevelError.String(), err, entry)
 		return
@@ -211,9 +277,105 @@ func (l *Logger) log(ctx context.Context, skip int, level Level, msg string, fie
 		fmt.Fprintf(os.Stderr, "logger write error: %v\n", err)
 	}
 
+	if l.auditEnabledLocked() {
+		l.writeAuditLocked(level, msg, entry, data)
+	}
+
 	if level == LevelFatal {
 		_ = os.Stdout.Sync()
 		os.Exit(1)
+	}
+}
+
+func (l *Logger) writeAuditLocked(level Level, msg string, entry map[string]any, raw []byte) {
+	now := time.Now()
+	hour := now.Format("2006-01-02_15")
+	lvl := strings.ToLower(level.String())
+	hourly := filepath.Join(l.auditDir, "hourly", lvl+"-"+hour+".log")
+	topics := []string{
+		hourly,
+		filepath.Join(l.auditDir, "topics", "all.log"),
+	}
+	if level >= LevelWarn {
+		topics = append(topics,
+			filepath.Join(l.auditDir, "topics", "warn-above.log"),
+			filepath.Join(l.auditDir, "rotate", "warn-"+hour+".rotate.log"),
+			filepath.Join(l.auditDir, "summaries", now.Format("2006-01-02")+".summary.ndjson"),
+		)
+	}
+	if reqID, ok := entry["req_id"].(string); ok && reqID != "" {
+		topics = append(topics, filepath.Join(l.auditDir, "by_req", reqID[:min(len(reqID), 2)]+".req.log"))
+	}
+	if path, ok := entry["path"].(string); ok && path != "" {
+		safe := strings.TrimPrefix(path, "/")
+		if safe == "" {
+			safe = "root"
+		}
+		safe = strings.ReplaceAll(safe, "/", "_")
+		if len(safe) > 48 {
+			safe = safe[:48]
+		}
+		topics = append(topics, filepath.Join(l.auditDir, "by_path", safe+".log"))
+	}
+	statuses, hasStatus := entry["status"].(float64)
+	if hasStatus && int(statuses) >= 400 {
+		topics = append(topics, filepath.Join(l.auditDir, "by_status", fmt.Sprintf("%dxx.log", int(statuses)/100)))
+	}
+	var copyBuf []byte
+	copyBuf = append(copyBuf, raw...)
+	copyBuf = append(copyBuf, '\n')
+	for i := 0; i < len(topics); i++ {
+		p := topics[i]
+		f, oerr := l.openAuditFile(p)
+		if oerr != nil {
+			continue
+		}
+		defer func(cf *os.File) {
+			_ = cf.Close()
+			l.opened.Add(-1)
+			openCounter.Add(-1)
+		}(f)
+		_, werr := f.Write(copyBuf)
+		if werr == nil && level >= LevelError {
+			name := filepath.Base(p)
+			summaryPath := filepath.Join(l.auditDir, "rollups", now.Format("2006-01-02_15"), name+".highlevel.tmp")
+			sf, serr := l.openAuditFile(summaryPath)
+			if serr == nil {
+				defer func(scf *os.File) {
+					_ = scf.Close()
+					l.opened.Add(-1)
+					openCounter.Add(-1)
+				}(sf)
+				headline := fmt.Sprintf("%s\t%s\t%s\n",
+					now.Format(time.RFC3339), level.String(), truncate(msg, 120))
+				_, _ = sf.WriteString(headline)
+			}
+		}
+	}
+}
+
+func truncate(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// EmitAuditBurst 接收多条字段并连续写审计日志。
+// 用于中间件层需要按目标分类批量记录时统一刷盘。
+func (l *Logger) EmitAuditBurst(ctx context.Context, level Level, msg string, burst []Fields) {
+	for i := 0; i < len(burst); i++ {
+		l.log(ctx, 1, level, msg, burst[i])
 	}
 }
 
