@@ -161,7 +161,11 @@ func (s *URLStore) Get(code string) (*model.ShortURL, error) {
 	if !ok {
 		return nil, model.ErrCodeNotFound
 	}
-	return u, nil
+	// 返回一致性快照拷贝：ShortURL 全为值类型（string/time.Time/int64/bool），
+	// clone 即完整一致的深拷贝。调用方持有私有拷贝，与 store 活态解耦，
+	// 避免与 IncrementVisits 等写者的字段读写竞争 / 跨版本字段撕裂。
+	clone := *u
+	return &clone, nil
 }
 
 func (s *URLStore) Exists(code string) (bool, error) {
@@ -186,7 +190,36 @@ func (s *URLStore) Save(u *model.ShortURL, overwrite bool) error {
 	if _, ok := s.urls[u.Code]; ok && !overwrite {
 		return model.ErrCodeConflict
 	}
-	s.urls[u.Code] = u
+	// 存私有拷贝：调用方后续改原指针不再污染 store 活态，
+	// 配合 Update 在锁内改字段，杜绝「Get→锁外改字段→Save」的 lost-update。
+	clone := *u
+	s.urls[u.Code] = &clone
+	s.dirty.Store(true)
+	if s.flushOn {
+		if err := s.flushLocked(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Update 在写锁内对单条记录执行原子更新：fn 拿到的是 store 持有的活指针，
+// 在锁内就地修改字段后回写为私有拷贝。取代「Get（拿共享指针）→ 锁外改字段 → Save」
+// 的写法，消除字段写与 IncrementVisits 的竞争及并发更新丢失。
+func (s *URLStore) Update(code string, fn func(u *model.ShortURL)) error {
+	if fn == nil {
+		return errors.New("store: nil update fn")
+	}
+	if !s.ready.Load() {
+		return model.ErrStoreNotReady
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.urls[code]
+	if !ok {
+		return model.ErrCodeNotFound
+	}
+	fn(u)
 	s.dirty.Store(true)
 	if s.flushOn {
 		if err := s.flushLocked(); err != nil {
@@ -245,25 +278,11 @@ func (s *URLStore) IncrementVisits(code string) (*model.ShortURL, error) {
 		}
 	}
 	s.dirty.Store(true)
-	return u, nil
+	// 返回增后一致性快照拷贝，而非活指针；
+	// 调用方读字段不再与后续 IncrementVisits 的写竞争。
+	clone := *u
+	return &clone, nil
 }
-
-func (s *URLStore) MuHack(code string, fn func(u *model.ShortURL)) error {
-	if !s.ready.Load() {
-		return model.ErrStoreNotReady
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	u, ok := s.urls[code]
-	if !ok {
-		return model.ErrCodeNotFound
-	}
-	fn(u)
-	s.dirty.Store(true)
-	return nil
-}
-
-func (s *URLStore) MuHackNoCode(fn func(u *model.ShortURL)) {}
 
 func (s *URLStore) ForEach(fn func(u *model.ShortURL) bool) error {
 	if !s.ready.Load() {
@@ -272,7 +291,9 @@ func (s *URLStore) ForEach(fn func(u *model.ShortURL) bool) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for _, u := range s.urls {
-		if !fn(u) {
+		// 传拷贝：回调不得在 ForEach 的 RLock 之外改活指针。
+		clone := *u
+		if !fn(&clone) {
 			return nil
 		}
 	}

@@ -22,6 +22,10 @@ type URLService struct {
 	store   *store.URLStore
 	gen     *shortcode.Generator
 	retries int
+
+	// invalidate 在条目被删除/禁用等失效后调用，用于通知解析层缓存失效。
+	// 可选；默认 nil 表示无缓存需要失效。由 main 注入 resolver.ObserveInvalidated。
+	invalidate func(code string)
 }
 
 func NewURLService(cfg *config.Config, s *store.URLStore) (*URLService, error) {
@@ -42,6 +46,18 @@ func NewURLService(cfg *config.Config, s *store.URLStore) (*URLService, error) {
 		gen:     gen,
 		retries: retries,
 	}, nil
+}
+
+// SetInvalidator 注入缓存失效回调（用于在删除/禁用后失效 resolver 的 LRU 缓存）。
+// 不注入则视为无缓存失效需求（保持向后兼容）。
+func (svc *URLService) SetInvalidator(fn func(code string)) {
+	svc.invalidate = fn
+}
+
+func (svc *URLService) invalidateCached(code string) {
+	if svc.invalidate != nil {
+		svc.invalidate(code)
+	}
 }
 
 func (svc *URLService) Create(ctx context.Context, req *model.CreateReq) (*model.ShortURL, error) {
@@ -90,15 +106,15 @@ func (svc *URLService) Create(ctx context.Context, req *model.CreateReq) (*model
 	}
 
 	u := &model.ShortURL{
-		Code:       code,
-		RawURL:     req.RawURL,
-		CreatedAt:  createdAt,
-		ExpireAt:   expireAt,
-		MaxVisits:  req.MaxVisits,
-		Visits:     0,
-		Custom:     custom,
-		Disabled:   false,
-		Remark:     req.Remark,
+		Code:      code,
+		RawURL:    req.RawURL,
+		CreatedAt: createdAt,
+		ExpireAt:  expireAt,
+		MaxVisits: req.MaxVisits,
+		Visits:    0,
+		Custom:    custom,
+		Disabled:  false,
+		Remark:    req.Remark,
 	}
 	if err := u.Validate(); err != nil {
 		return nil, err
@@ -150,6 +166,8 @@ func (svc *URLService) Delete(ctx context.Context, code string) error {
 	}
 	err := svc.store.Delete(code)
 	if err == nil {
+		// 删除后失效解析层缓存，否则缓存命中的冻结快照会让重定向仍返回旧结果。
+		svc.invalidateCached(code)
 		logger.CtxInfo(ctx, "short url deleted", logger.Fields{"code": code})
 	}
 	return err
@@ -159,14 +177,12 @@ func (svc *URLService) Disable(ctx context.Context, code string) error {
 	if err := model.ValidateCode(code); err != nil {
 		return err
 	}
-	u, err := svc.store.Get(code)
-	if err != nil {
+	// 在 store 写锁内原子置位，避免与 IncrementVisits 竞争 / 丢更新。
+	if err := svc.store.Update(code, func(u *model.ShortURL) { u.Disabled = true }); err != nil {
 		return err
 	}
-	u.Disabled = true
-	if err := svc.store.Save(u, true); err != nil {
-		return err
-	}
+	// 禁用后失效解析层缓存，使后续重定向回源拿到 Disabled=true 的最新快照返回 410。
+	svc.invalidateCached(code)
 	logger.CtxInfo(ctx, "short url disabled", logger.Fields{"code": code})
 	return nil
 }
@@ -175,12 +191,7 @@ func (svc *URLService) UpdateRemark(ctx context.Context, code, remark string) er
 	if err := model.ValidateCode(code); err != nil {
 		return err
 	}
-	u, err := svc.store.Get(code)
-	if err != nil {
-		return err
-	}
-	u.Remark = remark
-	return svc.store.Save(u, true)
+	return svc.store.Update(code, func(u *model.ShortURL) { u.Remark = remark })
 }
 
 type RedirectService struct {
@@ -323,38 +334,10 @@ func (r *RedirectService) SnapshotCached(code string) (*model.ShortURL, error) {
 	if u == nil {
 		return nil, model.ErrCodeNotFound
 	}
-	_ = u.Code
-	_ = u.RawURL
-	_ = u.Disabled
-	_ = u.Custom
-	remark := u.Remark
-	expireAt := u.ExpireAt
-	maxVisits := u.MaxVisits
-	visits := u.Visits
-	createdAt := u.CreatedAt
-	out := &model.ShortURL{
-		Code:       u.Code,
-		RawURL:     u.RawURL,
-		CreatedAt:  createdAt,
-		ExpireAt:   expireAt,
-		MaxVisits:  maxVisits,
-		Visits:     visits,
-		Custom:     u.Custom,
-		Disabled:   u.Disabled,
-		Remark:     remark,
-	}
-	_ = out
-	return &model.ShortURL{
-		Code:       u.Code,
-		RawURL:     u.RawURL,
-		CreatedAt:  createdAt,
-		ExpireAt:   expireAt,
-		MaxVisits:  maxVisits,
-		Visits:     visits,
-		Custom:     u.Custom,
-		Disabled:   u.Disabled,
-		Remark:     remark,
-	}, nil
+	// u 已是 store 返回的一致性快照拷贝（或缓存中的冻结快照），
+	// 直接拷贝一份返回，字段同版本、无撕裂。
+	out := *u
+	return &out, nil
 }
 
 func (r *RedirectService) appendLog(ctx context.Context, req *RedirectRequest, res *RedirectResult, raw string, u *model.ShortURL) {

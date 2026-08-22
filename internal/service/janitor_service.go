@@ -20,6 +20,10 @@ type JanitorService struct {
 	cfg      *config.JanitorCfg
 	urlStore *store.URLStore
 
+	// invalidate 在条目被巡检置为禁用后调用，用于通知解析层缓存失效。
+	// 可选；默认 nil 表示无缓存需要失效。由 main 注入 resolver.ObserveInvalidated。
+	invalidate func(code string)
+
 	wg       sync.WaitGroup
 	cancelFn context.CancelFunc
 	started  bool
@@ -35,6 +39,11 @@ func NewJanitorService(cfg *config.Config, us *store.URLStore) (*JanitorService,
 		cfg:      &cfg.Janitor,
 		urlStore: us,
 	}, nil
+}
+
+// SetInvalidator 注入缓存失效回调（用于在巡检禁用条目后失效 resolver 的 LRU 缓存）。
+func (j *JanitorService) SetInvalidator(fn func(code string)) {
+	j.invalidate = fn
 }
 
 // Start 启动后台巡检任务。若配置中关闭了 Janitor，会直接返回。
@@ -120,7 +129,7 @@ func (j *JanitorService) RunOnce(batch int) int {
 func (j *JanitorService) runOnce(batch int) int {
 	now := time.Now()
 	var processed, marked int
-	candidates := make([]*model.ShortURL, 0, batch)
+	candidates := make([]string, 0, batch)
 
 	err := j.urlStore.ForEach(func(u *model.ShortURL) bool {
 		if processed >= batch {
@@ -133,7 +142,7 @@ func (j *JanitorService) runOnce(batch int) int {
 			return true
 		}
 		if u.IsExpired(now) || u.ExceedsMaxVisits() {
-			candidates = append(candidates, u)
+			candidates = append(candidates, u.Code)
 			marked++
 		}
 		processed++
@@ -144,13 +153,16 @@ func (j *JanitorService) runOnce(batch int) int {
 		return 0
 	}
 
-	// 批量更新 Disabled 字段。
+	// 在 store 写锁内原子置 Disabled，消除「锁外改字段 + 与 IncrementVisits 竞争」。
 	updated := 0
-	for _, u := range candidates {
-		u.Disabled = true
-		if err := j.urlStore.Save(u, true); err != nil {
-			logger.Warn("janitor disable url error", logger.Fields{"err": err.Error(), "code": u.Code})
+	for _, code := range candidates {
+		if err := j.urlStore.Update(code, func(u *model.ShortURL) { u.Disabled = true }); err != nil {
+			logger.Warn("janitor disable url error", logger.Fields{"err": err.Error(), "code": code})
 			continue
+		}
+		// 失效解析层缓存，使后续重定向回源拿到 Disabled=true 的最新快照返回 410。
+		if j.invalidate != nil {
+			j.invalidate(code)
 		}
 		updated++
 	}

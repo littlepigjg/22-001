@@ -104,6 +104,10 @@ func main() {
 	if err != nil {
 		logger.Fatal("create redirect service failed", logger.Fields{"err": err.Error()})
 	}
+	// 注入解析层缓存失效回调：删除/禁用短码后失效 resolver 的 LRU 缓存，
+	// 否则冻结快照会让重定向返回与最新状态不一致的结果（如已禁用仍返回 302）。
+	invalidator := func(code string) { rdSvc.Resolver().ObserveInvalidated(code) }
+	urlSvc.SetInvalidator(invalidator)
 	stSvc, err := service.NewStatsService(conf, urlStore, logStore)
 	if err != nil {
 		logger.Fatal("create stats service failed", logger.Fields{"err": err.Error()})
@@ -116,6 +120,7 @@ func main() {
 	if err != nil {
 		logger.Fatal("create janitor service failed", logger.Fields{"err": err.Error()})
 	}
+	janitor.SetInvalidator(invalidator)
 	if err := janitor.Start(ctx); err != nil {
 		logger.Fatal("start janitor failed", logger.Fields{"err": err.Error()})
 	}
