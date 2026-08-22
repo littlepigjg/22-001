@@ -178,7 +178,7 @@ func (svc *URLService) Disable(ctx context.Context, code string) error {
 	if err != nil {
 		return err
 	}
-	u.Disabled = true
+	u.MarkDisabled()
 	if err := svc.store.Save(u, true); err != nil {
 		return err
 	}
@@ -195,7 +195,7 @@ func (svc *URLService) UpdateRemark(ctx context.Context, code, remark string) er
 	if err != nil {
 		return err
 	}
-	u.Remark = remark
+	u.SetRemark(remark)
 	return svc.store.Save(u, true)
 }
 
@@ -265,14 +265,17 @@ func (r *RedirectService) HandleRedirect(ctx context.Context, req *RedirectReque
 		return nil, err
 	}
 
+	// 取一份一致快照用于状态判断，避免与并发的 Visits/Disabled 写竞争。
+	snap := u.Snapshot()
+
 	// 2. 静态状态判断。
 	switch {
-	case u.Disabled:
+	case snap.Disabled:
 		result.Status = 410
 		result.Disabled = true
 		r.appendLog(ctx, req, result, "", u)
 		return result, nil
-	case u.IsExpired(ts):
+	case snap.IsExpired(ts):
 		result.Status = 410
 		result.Expired = true
 		r.appendLog(ctx, req, result, "", u)
@@ -284,7 +287,8 @@ func (r *RedirectService) HandleRedirect(ctx context.Context, req *RedirectReque
 	if err != nil {
 		return nil, err
 	}
-	if updated.MaxVisits > 0 && updated.Visits >= updated.MaxVisits {
+	upd := updated.Snapshot()
+	if upd.MaxVisits > 0 && upd.Visits >= upd.MaxVisits {
 		result.Status = 410
 		result.MaxVisited = true
 		r.appendLog(ctx, req, result, "", updated)
@@ -293,8 +297,8 @@ func (r *RedirectService) HandleRedirect(ctx context.Context, req *RedirectReque
 
 	// 4. 正常重定向。
 	result.Status = 302
-	result.RawURL = updated.RawURL
-	r.appendLog(ctx, req, result, updated.RawURL, updated)
+	result.RawURL = upd.RawURL
+	r.appendLog(ctx, req, result, upd.RawURL, updated)
 	return result, nil
 }
 

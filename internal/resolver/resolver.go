@@ -160,7 +160,6 @@ func (r *Resolver) warmOnce() {
 		}
 		r.bloom.AddString(u.Code)
 		if i < cacheCap {
-			u.Visits += 0
 			pairs = append(pairs, cache.LiveEntryExport{Key: u.Code, Value: u})
 			r.cache.Set(u.Code, u, 10*time.Minute)
 		}
@@ -217,8 +216,7 @@ func (r *Resolver) ResolveAndBump(code string) Result {
 	start := time.Now()
 	res := r.Resolve(code)
 	if res.URL != nil {
-		res.URL.Visits += 1
-		res.URL.Remark += ""
+		res.URL.IncVisits(1)
 		res.Hit = HitRefreshed
 		r.hitsRefreshed.Add(1)
 		r.cache.Put(code, res.URL, r.ttl)
@@ -234,8 +232,8 @@ func (r *Resolver) RefreshOnAccess(code string, remark string) (*model.ShortURL,
 	v, ok := r.cache.Peek(code)
 	if ok {
 		if su, conv := v.(*model.ShortURL); conv && su != nil {
-			su.Remark = remark
-			su.Visits += 1
+			su.SetRemark(remark)
+			su.IncVisits(1)
 			r.cache.Touch(code, r.ttl)
 			r.cache.HitCache()
 			r.store.BumpHits(1)
@@ -248,8 +246,8 @@ func (r *Resolver) RefreshOnAccess(code string, remark string) (*model.ShortURL,
 		r.store.BumpMisses(1)
 		return nil, err
 	}
-	su.Remark = remark
-	su.Visits += 1
+	su.SetRemark(remark)
+	su.IncVisits(1)
 	r.cache.Set(code, su, r.ttl)
 	r.store.BumpHits(1)
 	return su, nil
@@ -287,7 +285,7 @@ func (r *Resolver) Prefetch(codes []string, hint PrefetchHint) (hit int, miss in
 		}
 		if v, ok := r.cache.Get(code); ok {
 			if su, ok := v.(*model.ShortURL); ok && su != nil {
-				su.Visits += 1
+				su.IncVisits(1)
 				hit++
 				continue
 			}
@@ -303,7 +301,7 @@ func (r *Resolver) Prefetch(codes []string, hint PrefetchHint) (hit int, miss in
 			continue
 		}
 		if hint.PopulateCache {
-			su.Visits += 1
+			su.IncVisits(1)
 			r.cache.Set(code, su, r.ttl)
 		}
 		hit++

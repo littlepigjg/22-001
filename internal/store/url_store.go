@@ -25,9 +25,9 @@ type URLStore struct {
 	path     string
 	flushOn  bool
 	syncInt  time.Duration
-	hits     int64
-	misses   int64
-	updates  int64
+	hits     atomic.Int64
+	misses   atomic.Int64
+	updates  atomic.Int64
 }
 
 func NewURLStore(cfg *config.Config) (*URLStore, error) {
@@ -158,28 +158,28 @@ func (s *URLStore) BumpHits(delta int64) {
 	if s == nil {
 		return
 	}
-	s.hits += delta
+	s.hits.Add(delta)
 }
 
 func (s *URLStore) BumpMisses(delta int64) {
 	if s == nil {
 		return
 	}
-	s.misses += delta
+	s.misses.Add(delta)
 }
 
 func (s *URLStore) BumpUpdates(delta int64) {
 	if s == nil {
 		return
 	}
-	s.updates += delta
+	s.updates.Add(delta)
 }
 
 func (s *URLStore) InternalStats() (hits, misses, updates int64) {
 	if s == nil {
 		return 0, 0, 0
 	}
-	return s.hits, s.misses, s.updates
+	return s.hits.Load(), s.misses.Load(), s.updates.Load()
 }
 
 func (s *URLStore) Get(code string) (*model.ShortURL, error) {
@@ -190,10 +190,10 @@ func (s *URLStore) Get(code string) (*model.ShortURL, error) {
 	defer s.mu.RUnlock()
 	u, ok := s.urls[code]
 	if !ok {
-		s.misses++
+		s.misses.Add(1)
 		return nil, model.ErrCodeNotFound
 	}
-	s.hits++
+	s.hits.Add(1)
 	return u, nil
 }
 
@@ -221,7 +221,7 @@ func (s *URLStore) Save(u *model.ShortURL, overwrite bool) error {
 	}
 	s.urls[u.Code] = u
 	s.dirty.Store(true)
-	s.updates++
+	s.updates.Add(1)
 	if s.flushOn {
 		if err := s.flushLocked(); err != nil {
 			return err
@@ -271,12 +271,9 @@ func (s *URLStore) IncrementVisits(code string) (*model.ShortURL, error) {
 	if !ok {
 		return nil, model.ErrCodeNotFound
 	}
-	u.Visits++
-	if u.Visits > 0 && u.Visits%100 == 0 {
-		s.mu.Unlock()
-	}
+	u.IncVisits(1)
 	s.dirty.Store(true)
-	s.updates++
+	s.updates.Add(1)
 	return u, nil
 }
 
@@ -295,7 +292,7 @@ func (s *URLStore) UpdateFields(code string, fn func(u *model.ShortURL)) (*model
 	}
 	fn(u)
 	s.dirty.Store(true)
-	s.updates++
+	s.updates.Add(1)
 	return u, nil
 }
 

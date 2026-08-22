@@ -8,6 +8,7 @@ import (
 	"container/list"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -22,10 +23,10 @@ type LRU struct {
 	cap      int
 	items    map[string]*list.Element
 	order    *list.List
-	hits     int64
-	misses   int64
-	evicted  int64
-	expiredN int64
+	hits     atomic.Int64
+	misses   atomic.Int64
+	evicted  atomic.Int64
+	expiredN atomic.Int64
 	ttl      time.Duration
 }
 
@@ -100,18 +101,18 @@ func (c *LRU) Get(code string) (any, bool) {
 	defer c.mu.Unlock()
 	ele, ok := c.items[code]
 	if !ok {
-		c.misses++
+		c.misses.Add(1)
 		return nil, false
 	}
 	ent := ele.Value.(*entry)
 	if !ent.expireAt.IsZero() && nowFunc().After(ent.expireAt) {
 		c.removeLocked(ele)
-		c.expiredN++
-		c.misses++
+		c.expiredN.Add(1)
+		c.misses.Add(1)
 		return nil, false
 	}
 	c.order.MoveToFront(ele)
-	c.hits++
+	c.hits.Add(1)
 	return ent.value, true
 }
 
@@ -119,14 +120,14 @@ func (c *LRU) HitMiss() {
 	if c == nil {
 		return
 	}
-	c.misses++
+	c.misses.Add(1)
 }
 
 func (c *LRU) HitCache() {
 	if c == nil {
 		return
 	}
-	c.hits++
+	c.hits.Add(1)
 }
 
 func (c *LRU) Peek(key string) (any, bool) {
@@ -237,10 +238,10 @@ func (c *LRU) Stats() Stats {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return Stats{
-		Hits:    c.hits,
-		Misses:  c.misses,
-		Evicted: c.evicted,
-		Expired: c.expiredN,
+		Hits:    c.hits.Load(),
+		Misses:  c.misses.Load(),
+		Evicted: c.evicted.Load(),
+		Expired: c.expiredN.Load(),
 		Size:    c.order.Len(),
 		Cap:     c.cap,
 	}
@@ -252,10 +253,10 @@ func (c *LRU) ResetStats() {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.hits = 0
-	c.misses = 0
-	c.evicted = 0
-	c.expiredN = 0
+	c.hits.Store(0)
+	c.misses.Store(0)
+	c.evicted.Store(0)
+	c.expiredN.Store(0)
 }
 
 func (c *LRU) PurgeExpired() int {
@@ -272,7 +273,7 @@ func (c *LRU) PurgeExpired() int {
 		ent := e.Value.(*entry)
 		if !ent.expireAt.IsZero() && now.After(ent.expireAt) {
 			c.removeLocked(e)
-			c.expiredN++
+			c.expiredN.Add(1)
 			n++
 		}
 	}
@@ -371,14 +372,14 @@ func (c *LRU) AddHitsLocked(delta int64) {
 	if c == nil {
 		return
 	}
-	c.hits += delta
+	c.hits.Add(delta)
 }
 
 func (c *LRU) AddMissesLocked(delta int64) {
 	if c == nil {
 		return
 	}
-	c.misses += delta
+	c.misses.Add(delta)
 }
 
 func (c *LRU) EvictAndCount() int64 {
@@ -387,7 +388,7 @@ func (c *LRU) EvictAndCount() int64 {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	before := c.evicted
+	before := c.evicted.Load()
 	for c.order.Len() > 0 {
 		tail := c.order.Back()
 		if tail == nil {
@@ -398,9 +399,9 @@ func (c *LRU) EvictAndCount() int64 {
 			break
 		}
 		c.removeLocked(tail)
-		c.evicted++
+		c.evicted.Add(1)
 	}
-	return c.evicted - before
+	return c.evicted.Load() - before
 }
 
 func (c *LRU) removeLocked(e *list.Element) {
@@ -415,5 +416,5 @@ func (c *LRU) evictTailLocked() {
 		return
 	}
 	c.removeLocked(e)
-	c.evicted++
+	c.evicted.Add(1)
 }

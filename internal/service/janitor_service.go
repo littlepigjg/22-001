@@ -129,10 +129,11 @@ func (j *JanitorService) runOnce(batch int) int {
 		if u == nil {
 			return true
 		}
-		if u.Disabled {
+		snap := u.Snapshot()
+		if snap.Disabled {
 			return true
 		}
-		if u.IsExpired(now) || u.ExceedsMaxVisits() {
+		if snap.IsExpired(now) || snap.ExceedsMaxVisits() {
 			candidates = append(candidates, u)
 			marked++
 		}
@@ -147,7 +148,7 @@ func (j *JanitorService) runOnce(batch int) int {
 	// 批量更新 Disabled 字段。
 	updated := 0
 	for _, u := range candidates {
-		u.Disabled = true
+		u.MarkDisabled()
 		if err := j.urlStore.Save(u, true); err != nil {
 			logger.Warn("janitor disable url error", logger.Fields{"err": err.Error(), "code": u.Code})
 			continue

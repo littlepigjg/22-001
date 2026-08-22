@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -36,6 +37,63 @@ type ShortURL struct {
 
 	// 备注信息，可选。
 	Remark string `json:"remark,omitempty"`
+
+	// mu 保护下面这些易变字段（Visits/Remark/MaxVisits/Disabled）的并发读改写。
+	// ShortURL 会被 store、cache、resolver 多个协程共享同一指针，裸字段读写会触发 DATA RACE。
+	// 不参与 JSON 序列化（零值即未上锁状态，反序列化得到的记录默认未上锁，符合预期）。
+	mu sync.Mutex `json:"-"`
+}
+
+// IncVisits 原子地把访问次数加 n，返回加完后的值。并发安全。
+func (s *ShortURL) IncVisits(n int64) int64 {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Visits += n
+	return s.Visits
+}
+
+// SetRemark 在锁保护下更新备注。并发安全。
+func (s *ShortURL) SetRemark(remark string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Remark = remark
+}
+
+// MarkDisabled 在锁保护下把记录置为禁用。并发安全。
+func (s *ShortURL) MarkDisabled() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Disabled = true
+}
+
+// Snapshot 返回一份加锁拷贝的值副本，用于并发场景下安全读取全量字段。
+// 通过逐字段构造返回值，避免连同未导出的互斥锁一起按值复制。
+func (s *ShortURL) Snapshot() ShortURL {
+	if s == nil {
+		return ShortURL{}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return ShortURL{
+		Code:      s.Code,
+		RawURL:    s.RawURL,
+		CreatedAt: s.CreatedAt,
+		ExpireAt:  s.ExpireAt,
+		MaxVisits: s.MaxVisits,
+		Visits:    s.Visits,
+		Custom:    s.Custom,
+		Disabled:  s.Disabled,
+		Remark:    s.Remark,
+	}
 }
 
 // IsExpired 判断记录是否已经过期（根据 ExpireAt）。
