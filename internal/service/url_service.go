@@ -27,6 +27,9 @@ type URLService struct {
 	retries int
 }
 
+// BatchSizeMax 是单次批量创建允许的最大条目数。
+const BatchSizeMax = 200
+
 // NewURLService 构造 URLService。
 func NewURLService(cfg *config.Config, s *store.URLStore) (*URLService, error) {
 	if cfg == nil || s == nil {
@@ -46,6 +49,22 @@ func NewURLService(cfg *config.Config, s *store.URLStore) (*URLService, error) {
 		gen:     gen,
 		retries: retries,
 	}, nil
+}
+
+// BatchResult 表示批量创建中每一条的结果。
+type BatchResult struct {
+	Index int
+	URL   *model.ShortURL
+	Err   error
+}
+
+// BuildBatchRequests 把一组 RawURL 包装成 CreateReq 列表。
+func BuildBatchRequests(raws []string) []*model.CreateReq {
+	out := make([]*model.CreateReq, 0, len(raws))
+	for _, r := range raws {
+		out = append(out, &model.CreateReq{RawURL: r})
+	}
+	return out
 }
 
 // Create 根据请求创建一条新的短链接记录并持久化。
@@ -120,6 +139,123 @@ func (svc *URLService) Create(ctx context.Context, req *model.CreateReq) (*model
 		"custom": custom,
 	})
 	return u, nil
+}
+
+// CreateMany 批量创建多条短链接。
+// 为了减少加锁次数，会一次性向 shortcode.Generator 请求足够多的候选短码，
+// 然后按顺序分配给各条请求，遇到冲突再回退为单条重试。
+func (svc *URLService) CreateMany(ctx context.Context, reqs []*model.CreateReq) ([]*BatchResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if reqs == nil {
+		return nil, errors.New("service: nil batch request")
+	}
+	if len(reqs) == 0 {
+		return []*BatchResult{}, nil
+	}
+	if len(reqs) > BatchSizeMax {
+		return nil, errors.New("service: batch too large")
+	}
+
+	results := make([]*BatchResult, len(reqs))
+	for i := range results {
+		results[i] = &BatchResult{Index: i}
+	}
+
+	total := len(reqs)
+	codes, err := svc.gen.GenerateMany(total)
+	if err != nil {
+		return nil, err
+	}
+	createdAt := time.Now()
+	for i, req := range reqs {
+		if req == nil {
+			results[i].Err = errors.New("service: nil item request")
+			continue
+		}
+		if verr := req.Validate(); verr != nil {
+			results[i].Err = verr
+			continue
+		}
+		var (
+			code     string
+			custom   bool
+			expireAt time.Time
+		)
+		if req.CustomCode != "" {
+			code = req.CustomCode
+			custom = true
+			ok, exErr := svc.store.Exists(code)
+			if exErr != nil {
+				results[i].Err = exErr
+				continue
+			}
+			if ok {
+				results[i].Err = model.ErrCodeConflict
+				continue
+			}
+		} else {
+			code = codes[i]
+			ok, exErr := svc.store.Exists(code)
+			if exErr != nil {
+				results[i].Err = exErr
+				continue
+			}
+			if ok {
+				fallback, fErr := svc.generateUnique(ctx)
+				if fErr != nil {
+					results[i].Err = fErr
+					continue
+				}
+				code = fallback
+			}
+		}
+		if !req.ExpireAt.IsZero() {
+			expireAt = req.ExpireAt
+		} else if req.TTL > 0 {
+			expireAt = createdAt.Add(req.TTL)
+		}
+		u := &model.ShortURL{
+			Code:      code,
+			RawURL:    req.RawURL,
+			CreatedAt: createdAt,
+			ExpireAt:  expireAt,
+			MaxVisits: req.MaxVisits,
+			Visits:    0,
+			Custom:    custom,
+			Disabled:  false,
+			Remark:    req.Remark,
+		}
+		if verr := u.Validate(); verr != nil {
+			results[i].Err = verr
+			continue
+		}
+		if sErr := svc.store.Save(u, false); sErr != nil {
+			if errors.Is(sErr, model.ErrCodeConflict) {
+				fallback, fErr := svc.generateUnique(ctx)
+				if fErr != nil {
+					results[i].Err = fErr
+					continue
+				}
+				u.Code = fallback
+				if sErr2 := svc.store.Save(u, false); sErr2 != nil {
+					results[i].Err = sErr2
+					continue
+				}
+			} else {
+				results[i].Err = sErr
+				continue
+			}
+		}
+		results[i].URL = u
+		logger.CtxInfo(ctx, "short url batch-created", logger.Fields{
+			"code":  u.Code,
+			"raw":   u.RawURL,
+			"index": i,
+		})
+	}
+	return results, nil
 }
 
 // generateUnique 生成一个尚未存在的短码，失败重试最多 retries 次。

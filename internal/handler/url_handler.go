@@ -35,6 +35,14 @@ func (h *URLHandler) Register(mux *http.ServeMux) {
 			response.Fail(w, http.StatusMethodNotAllowed, response.CodeBadReq, "method not allowed")
 		}
 	})
+	mux.HandleFunc("/api/urls/batch", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			h.CreateMany(w, r)
+		default:
+			response.Fail(w, http.StatusMethodNotAllowed, response.CodeBadReq, "method not allowed")
+		}
+	})
 	mux.HandleFunc("/api/urls/", func(w http.ResponseWriter, r *http.Request) {
 		code := strings.TrimPrefix(r.URL.Path, "/api/urls/")
 		code = strings.TrimSpace(code)
@@ -166,4 +174,95 @@ func (h *URLHandler) Patch(w http.ResponseWriter, r *http.Request, code string) 
 		return
 	}
 	response.OK(w, latest)
+}
+
+// itemErr 描述批量创建中单条错误。
+type itemErr struct {
+	Index int    `json:"index"`
+	Error string `json:"error"`
+}
+
+// CreateMany 处理批量创建短链接。
+//
+//	POST /api/urls/batch
+//	Request:  { items: [{ raw_url, custom_code?, ttl_seconds?, expire_at?, max_visits?, remark? }, ...] }
+//	Response: { results: [{ index, code?, raw_url?, created_at?, error? }, ...] }
+func (h *URLHandler) CreateMany(w http.ResponseWriter, r *http.Request) {
+	type batchItem struct {
+		RawURL     string `json:"raw_url"`
+		CustomCode string `json:"custom_code,omitempty"`
+		TTLSeconds int64  `json:"ttl_seconds,omitempty"`
+		ExpireAt   string `json:"expire_at,omitempty"`
+		MaxVisits  int64  `json:"max_visits,omitempty"`
+		Remark     string `json:"remark,omitempty"`
+	}
+	type batchBody struct {
+		Items []batchItem `json:"items"`
+	}
+	var body batchBody
+	if err := DecodeJSON(r, &body); err != nil {
+		response.BadRequest(w, err.Error())
+		return
+	}
+	if len(body.Items) == 0 {
+		response.BadRequest(w, "items is required and cannot be empty")
+		return
+	}
+	reqs := make([]*model.CreateReq, 0, len(body.Items))
+	for _, it := range body.Items {
+		cr := &model.CreateReq{
+			RawURL:     it.RawURL,
+			CustomCode: it.CustomCode,
+			MaxVisits:  it.MaxVisits,
+			Remark:     it.Remark,
+		}
+		if it.TTLSeconds > 0 {
+			cr.TTL = time.Duration(it.TTLSeconds) * time.Second
+		}
+		if it.ExpireAt != "" {
+			if t, err := time.Parse(time.RFC3339, it.ExpireAt); err == nil {
+				cr.ExpireAt = t
+			} else {
+				response.BadRequest(w, "invalid expire_at, must be RFC3339")
+				return
+			}
+		}
+		reqs = append(reqs, cr)
+	}
+	results, err := h.svc.CreateMany(r.Context(), reqs)
+	if err != nil {
+		httperr.Map(w, err)
+		return
+	}
+	type outItem struct {
+		Index     int       `json:"index"`
+		Code      string    `json:"code,omitempty"`
+		RawURL    string    `json:"raw_url,omitempty"`
+		CreatedAt time.Time `json:"created_at,omitempty"`
+		Error     string    `json:"error,omitempty"`
+	}
+	out := make([]outItem, 0, len(results))
+	errs := make([]itemErr, 0)
+	for _, r := range results {
+		oi := outItem{Index: r.Index}
+		if r.Err != nil {
+			oi.Error = r.Err.Error()
+			errs = append(errs, itemErr{Index: r.Index, Error: r.Err.Error()})
+		} else if r.URL != nil {
+			oi.Code = r.URL.Code
+			oi.RawURL = r.URL.RawURL
+			oi.CreatedAt = r.URL.CreatedAt
+		}
+		out = append(out, oi)
+	}
+	resp := map[string]any{
+		"results": out,
+		"count":   len(results),
+		"errors":  errs,
+	}
+	if len(errs) == len(results) && len(results) > 0 {
+		response.Fail(w, http.StatusBadRequest, response.CodeBadReq, "all batch items failed")
+		return
+	}
+	response.OK(w, resp)
 }
