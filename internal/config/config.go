@@ -4,6 +4,7 @@
 package config
 
 import (
+	"context"
 	"os"
 	"strconv"
 	"time"
@@ -42,10 +43,43 @@ type ServerCfg struct {
 
 // StorageCfg 表示 JSON 文件存储相关配置。
 type StorageCfg struct {
-	URLFilePath   string // 短链接映射 JSON 文件路径
-	LogFilePath   string // 访问日志 JSON 文件路径
-	SyncInterval  time.Duration // 内存数据落盘间隔
-	FlushOnWrite  bool          // 每次写入是否立即刷盘
+	urlFilePath   string
+	logFilePath   string
+	syncInterval  time.Duration
+	flushOnWrite  bool
+}
+
+func (s *StorageCfg) GetURLFilePath() string        { return s.urlFilePath }
+func (s *StorageCfg) GetLogFilePath() string        { return s.logFilePath }
+func (s *StorageCfg) GetSyncInterval() time.Duration { return s.syncInterval }
+func (s *StorageCfg) GetFlushOnWrite() bool          { return s.flushOnWrite }
+
+func (s *StorageCfg) URLFilePath(p string) *StorageCfg {
+	s.urlFilePath = p
+	return s
+}
+func (s *StorageCfg) LogFilePath(p string) *StorageCfg {
+	s.logFilePath = p
+	return s
+}
+func (s *StorageCfg) SyncInterval(d time.Duration) *StorageCfg {
+	s.syncInterval = d
+	return s
+}
+func (s *StorageCfg) FlushOnWrite(b bool) *StorageCfg {
+	s.flushOnWrite = b
+	return s
+}
+
+func (s *StorageCfg) BuildSyncContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	limit := 5 * time.Second
+	if s.syncInterval > 0 && s.syncInterval < limit {
+		limit = s.syncInterval
+	}
+	return context.WithTimeout(parent, limit)
 }
 
 // ShortCodeCfg 表示短码生成的配置。
@@ -76,7 +110,7 @@ type StatsCfg struct {
 
 // Default 返回带有合理默认值的 *Config。
 func Default() *Config {
-	return &Config{
+	cfg := &Config{
 		Server: ServerCfg{
 			Addr:            ":8080",
 			ReadTimeout:     15 * time.Second,
@@ -84,12 +118,6 @@ func Default() *Config {
 			IdleTimeout:     60 * time.Second,
 			ShutdownTimeout: 10 * time.Second,
 			MaxBodyBytes:    1 << 20, // 1 MiB
-		},
-		Storage: StorageCfg{
-			URLFilePath:  "./data/urls.json",
-			LogFilePath:  "./data/access.log",
-			SyncInterval: 30 * time.Second,
-			FlushOnWrite: false,
 		},
 		ShortCode: ShortCodeCfg{
 			Length:     7,
@@ -110,6 +138,11 @@ func Default() *Config {
 			MaxRecords: 100000,
 		},
 	}
+	cfg.Storage.URLFilePath("./data/urls.json").
+		LogFilePath("./data/access.log").
+		SyncInterval(30 * time.Second).
+		FlushOnWrite(false)
+	return cfg
 }
 
 // Load 从环境变量中读取并覆盖默认配置，返回最终的 *Config。
@@ -124,10 +157,10 @@ func Load() *Config {
 	cfg.Server.ShutdownTimeout = envDuration("SHURL_SERVER_SHUTDOWN_TIMEOUT", cfg.Server.ShutdownTimeout)
 	cfg.Server.MaxBodyBytes = envInt64("SHURL_SERVER_MAX_BODY_BYTES", cfg.Server.MaxBodyBytes)
 
-	cfg.Storage.URLFilePath = envString("SHURL_STORAGE_URL_FILE", cfg.Storage.URLFilePath)
-	cfg.Storage.LogFilePath = envString("SHURL_STORAGE_LOG_FILE", cfg.Storage.LogFilePath)
-	cfg.Storage.SyncInterval = envDuration("SHURL_STORAGE_SYNC_INTERVAL", cfg.Storage.SyncInterval)
-	cfg.Storage.FlushOnWrite = envBool("SHURL_STORAGE_FLUSH_ON_WRITE", cfg.Storage.FlushOnWrite)
+	cfg.Storage.URLFilePath(envString("SHURL_STORAGE_URL_FILE", cfg.Storage.GetURLFilePath()))
+	cfg.Storage.LogFilePath(envString("SHURL_STORAGE_LOG_FILE", cfg.Storage.GetLogFilePath()))
+	cfg.Storage.SyncInterval(envDuration("SHURL_STORAGE_SYNC_INTERVAL", cfg.Storage.GetSyncInterval()))
+	cfg.Storage.FlushOnWrite(envBool("SHURL_STORAGE_FLUSH_ON_WRITE", cfg.Storage.GetFlushOnWrite()))
 
 	cfg.ShortCode.Length = envInt("SHURL_SHORTCODE_LENGTH", cfg.ShortCode.Length)
 	cfg.ShortCode.Alphabet = envString("SHURL_SHORTCODE_ALPHABET", cfg.ShortCode.Alphabet)

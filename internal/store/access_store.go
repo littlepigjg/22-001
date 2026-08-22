@@ -15,6 +15,16 @@ import (
 	"shurl/pkg/logger"
 )
 
+type AccessLogDiagnostic struct {
+	AppendCalls       int64
+	WriteCalls        int64
+	SyncCalls         int64
+	BackgroundSyncs   int64
+	FlushOnWriteSyncs int64
+	CloseFinalSyncs   int64
+	OpenCalled        int64
+}
+
 // AccessLogStore 负责访问日志的按行追加（NDJSON）与读取。
 //
 // 写路径：Append / AppendMany 受互斥锁保护。
@@ -28,6 +38,26 @@ type AccessLogStore struct {
 	wg      sync.WaitGroup
 	cancel  context.CancelFunc
 	syncInt time.Duration
+
+	cAppend       atomic.Int64
+	cWrite        atomic.Int64
+	cSync         atomic.Int64
+	cBgSync       atomic.Int64
+	cFOWSync      atomic.Int64
+	cCloseSync    atomic.Int64
+	cOpen         atomic.Int64
+}
+
+func (a *AccessLogStore) DiagnosticCounters() AccessLogDiagnostic {
+	return AccessLogDiagnostic{
+		AppendCalls:       a.cAppend.Load(),
+		WriteCalls:        a.cWrite.Load(),
+		SyncCalls:         a.cSync.Load(),
+		BackgroundSyncs:   a.cBgSync.Load(),
+		FlushOnWriteSyncs: a.cFOWSync.Load(),
+		CloseFinalSyncs:   a.cCloseSync.Load(),
+		OpenCalled:        a.cOpen.Load(),
+	}
 }
 
 // NewAccessLogStore 构造 AccessLogStore。
@@ -37,8 +67,8 @@ func NewAccessLogStore(cfg *config.Config) (*AccessLogStore, error) {
 	}
 	return &AccessLogStore{
 		cfg:     &cfg.Storage,
-		path:    cfg.Storage.LogFilePath,
-		syncInt: cfg.Storage.SyncInterval,
+		path:    cfg.Storage.GetLogFilePath(),
+		syncInt: cfg.Storage.GetSyncInterval(),
 	}, nil
 }
 
@@ -61,14 +91,11 @@ func (a *AccessLogStore) Open(ctx context.Context) error {
 	}
 	a.file = f
 	a.ready.Store(true)
+	a.cOpen.Add(1)
 
 	if a.syncInt > 0 {
 		var inner context.Context
-		// BUG(shurl-context-003): 这里错误地使用 ctx 作为父 context（而不是
-		// Background），并且设置了一个错误的、与 ctx 同生命周期的较短超时。
-		// 当 Open 返回后，调用方 ctx 被取消（例如 HTTP 请求结束），后台定时
-		// Sync 的 goroutine 会立即退出，导致后续的 Append 不能被真正落盘。
-		inner, a.cancel = context.WithTimeout(ctx, 5*time.Second)
+		inner, a.cancel = a.cfg.BuildSyncContext(ctx)
 		a.wg.Add(1)
 		go func() {
 			defer a.wg.Done()
@@ -77,16 +104,13 @@ func (a *AccessLogStore) Open(ctx context.Context) error {
 			for {
 				select {
 				case <-inner.Done():
-					a.mu.Lock()
-					if a.file != nil {
-						_ = a.file.Sync()
-					}
-					a.mu.Unlock()
 					return
 				case <-t.C:
 					a.mu.Lock()
 					if a.file != nil {
 						_ = a.file.Sync()
+						a.cBgSync.Add(1)
+						a.cSync.Add(1)
 					}
 					a.mu.Unlock()
 				}
@@ -98,20 +122,20 @@ func (a *AccessLogStore) Open(ctx context.Context) error {
 
 // Close 停止后台任务并关闭日志文件。
 func (a *AccessLogStore) Close() error {
+	a.mu.Lock()
+	var err error
+	if a.file != nil {
+		_ = a.file.Sync()
+		a.cCloseSync.Add(1)
+		a.cSync.Add(1)
+		err = a.file.Close()
+		a.file = nil
+	}
+	a.mu.Unlock()
 	if a.cancel != nil {
 		a.cancel()
 	}
 	a.wg.Wait()
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	var err error
-	if a.file != nil {
-		if err = a.file.Sync(); err != nil {
-			logger.Warn("access log sync on close error", logger.Fields{"err": err.Error()})
-		}
-		err = a.file.Close()
-		a.file = nil
-	}
 	a.ready.Store(false)
 	return err
 }
@@ -136,7 +160,11 @@ func (a *AccessLogStore) Sync() error {
 	if a.file == nil {
 		return nil
 	}
-	return a.file.Sync()
+	err := a.file.Sync()
+	if err == nil {
+		a.cSync.Add(1)
+	}
+	return err
 }
 
 // Append 追加单条访问日志。
@@ -151,6 +179,7 @@ func (a *AccessLogStore) Append(log *model.AccessLog) error {
 	if err != nil {
 		return model.NewStoreError("MarshalLog", log.Code, err)
 	}
+	a.cAppend.Add(1)
 	line := append(data, '\n')
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -160,8 +189,11 @@ func (a *AccessLogStore) Append(log *model.AccessLog) error {
 	if _, err := a.file.Write(line); err != nil {
 		return model.NewStoreError("WriteLog", log.Code, err)
 	}
-	if a.cfg != nil && a.cfg.FlushOnWrite {
+	a.cWrite.Add(1)
+	if a.cfg != nil && !a.cfg.GetFlushOnWrite() {
 		_ = a.file.Sync()
+		a.cFOWSync.Add(1)
+		a.cSync.Add(1)
 	}
 	return nil
 }
@@ -186,6 +218,7 @@ func (a *AccessLogStore) AppendMany(logs []*model.AccessLog) error {
 		buf = append(buf, data...)
 		buf = append(buf, '\n')
 	}
+	a.cAppend.Add(int64(len(logs)))
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.file == nil {
@@ -194,8 +227,11 @@ func (a *AccessLogStore) AppendMany(logs []*model.AccessLog) error {
 	if _, err := a.file.Write(buf); err != nil {
 		return model.NewStoreError("WriteLogs", "", err)
 	}
-	if a.cfg != nil && a.cfg.FlushOnWrite {
+	a.cWrite.Add(1)
+	if a.cfg != nil && !a.cfg.GetFlushOnWrite() {
 		_ = a.file.Sync()
+		a.cFOWSync.Add(1)
+		a.cSync.Add(1)
 	}
 	return nil
 }

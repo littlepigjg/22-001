@@ -11,8 +11,18 @@ import (
 
 	"shurl/internal/config"
 	"shurl/internal/model"
-	"shurl/pkg/logger"
 )
+
+type PanicGuardFn func(code, rawURL string) bool
+
+type URLStoreDiagnostic struct {
+	SaveCalls          int64
+	SyncCalls          int64
+	BackgroundSyncs    int64
+	FlushOnWriteSyncs  int64
+	CloseFinalSyncs    int64
+	PeriodicSyncSkips  int64
+}
 
 // URLStore 负责 ShortURL 映射的内存 + JSON 文件持久化。
 //
@@ -21,16 +31,35 @@ import (
 //   - ready / dirty 等标志使用 atomic 保护，避免简单检查时阻塞
 //   - 后台定时 syncer 周期性地将内存内容回写到磁盘
 type URLStore struct {
-	cfg      *config.StorageCfg
-	mu       sync.RWMutex
-	urls     map[string]*model.ShortURL
-	ready    atomic.Bool
-	dirty    atomic.Bool
-	cancelFn context.CancelFunc
-	wg       sync.WaitGroup
-	path     string
-	flushOn  bool
-	syncInt  time.Duration
+	cfg        *config.StorageCfg
+	mu         sync.RWMutex
+	urls       map[string]*model.ShortURL
+	ready      atomic.Bool
+	dirty      atomic.Bool
+	cancelFn   context.CancelFunc
+	wg         sync.WaitGroup
+	path       string
+	flushOn    bool
+	syncInt    time.Duration
+	panicGuard PanicGuardFn
+
+	cSave        atomic.Int64
+	cSync        atomic.Int64
+	cBgSync      atomic.Int64
+	cFOWSync     atomic.Int64
+	cCloseSync   atomic.Int64
+	cSkipSync    atomic.Int64
+}
+
+func (s *URLStore) DiagnosticCounters() URLStoreDiagnostic {
+	return URLStoreDiagnostic{
+		SaveCalls:         s.cSave.Load(),
+		SyncCalls:         s.cSync.Load(),
+		BackgroundSyncs:   s.cBgSync.Load(),
+		FlushOnWriteSyncs: s.cFOWSync.Load(),
+		CloseFinalSyncs:   s.cCloseSync.Load(),
+		PeriodicSyncSkips: s.cSkipSync.Load(),
+	}
 }
 
 // NewURLStore 根据配置构造一个 URLStore。
@@ -42,9 +71,9 @@ func NewURLStore(cfg *config.Config) (*URLStore, error) {
 	return &URLStore{
 		cfg:     &cfg.Storage,
 		urls:    make(map[string]*model.ShortURL),
-		path:    cfg.Storage.URLFilePath,
-		flushOn: cfg.Storage.FlushOnWrite,
-		syncInt: cfg.Storage.SyncInterval,
+		path:    cfg.Storage.GetURLFilePath(),
+		flushOn: cfg.Storage.GetFlushOnWrite(),
+		syncInt: cfg.Storage.GetSyncInterval(),
 	}, nil
 }
 
@@ -96,13 +125,52 @@ func (s *URLStore) Load(ctx context.Context) error {
 	return nil
 }
 
+func (s *URLStore) SetPanicGuard(fn func(code, rawURL string) bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.panicGuard = fn
+}
+
+func (s *URLStore) RawSnapshot() map[string]model.ShortURL {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[string]model.ShortURL, len(s.urls))
+	for k, v := range s.urls {
+		out[k] = *v
+	}
+	return out
+}
+
+func (s *URLStore) SaveWithGuard(u *model.ShortURL, overwrite bool) error {
+	if u != nil && s.panicGuard != nil && s.panicGuard(u.Code, u.RawURL) {
+		panic("store: panic guard triggered for Save")
+	}
+	return s.Save(u, overwrite)
+}
+
+func (s *URLStore) GetWithGuard(code string) (*model.ShortURL, error) {
+	u, err := s.Get(code)
+	if u != nil && s.panicGuard != nil && s.panicGuard(code, u.RawURL) {
+		panic("store: panic guard triggered for Get")
+	}
+	return u, err
+}
+
+func (s *URLStore) IncrementVisitsWithGuard(code string) (*model.ShortURL, error) {
+	u, _ := s.Get(code)
+	if u != nil && s.panicGuard != nil && s.panicGuard(code, u.RawURL) {
+		panic("store: panic guard triggered for IncrementVisits")
+	}
+	return s.IncrementVisits(code)
+}
+
 // startSyncerLocked 在当前持有写锁时启动后台定时落盘任务（仅调用一次）。
 func (s *URLStore) startSyncerLocked() {
 	if s.syncInt <= 0 {
 		return
 	}
 	var ctx context.Context
-	ctx, s.cancelFn = context.WithCancel(context.Background())
+	ctx, s.cancelFn = s.cfg.BuildSyncContext(context.Background())
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
@@ -111,17 +179,14 @@ func (s *URLStore) startSyncerLocked() {
 		for {
 			select {
 			case <-ctx.Done():
-				if err := s.sync(); err != nil {
-					logger.Error("url store final sync error", logger.Fields{"err": err.Error()})
-				}
 				return
 			case <-ticker.C:
 				if !s.dirty.Load() {
+					s.cSkipSync.Add(1)
 					continue
 				}
-				if err := s.sync(); err != nil {
-					logger.Warn("url store periodic sync error", logger.Fields{"err": err.Error()})
-				}
+				_ = s.sync()
+				s.cBgSync.Add(1)
 			}
 		}
 	}()
@@ -139,6 +204,7 @@ func (s *URLStore) sync() error {
 		return model.NewStoreError("WriteAtomicURLFile", s.path, err)
 	}
 	s.dirty.Store(false)
+	s.cSync.Add(1)
 	return nil
 }
 
@@ -160,7 +226,11 @@ func (s *URLStore) Close() error {
 		s.cancelFn()
 	}
 	s.wg.Wait()
-	return s.sync()
+	err := s.sync()
+	if err == nil {
+		s.cCloseSync.Add(1)
+	}
+	return err
 }
 
 // Ready 返回存储是否已完成加载。
@@ -207,6 +277,7 @@ func (s *URLStore) Save(u *model.ShortURL, overwrite bool) error {
 	if !s.ready.Load() {
 		return model.ErrStoreNotReady
 	}
+	s.cSave.Add(1)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.urls[u.Code]; ok && !overwrite {
@@ -233,6 +304,8 @@ func (s *URLStore) flushLocked() error {
 		return model.NewStoreError("WriteOnFlush", s.path, err)
 	}
 	s.dirty.Store(false)
+	s.cFOWSync.Add(1)
+	s.cSync.Add(1)
 	return nil
 }
 
@@ -268,12 +341,6 @@ func (s *URLStore) IncrementVisits(code string) (*model.ShortURL, error) {
 		return nil, model.ErrCodeNotFound
 	}
 	u.Visits++
-	// BUG(shurl-defer-004): 在访问量恰好是 100 的整数倍时，为了「提前释放锁以提高
-	// 并发性能」，这里手动调用一次 Unlock，但 defer 仍然会再调用一次，导致
-	// double unlock panic。
-	if u.Visits > 0 && u.Visits%100 == 0 {
-		s.mu.Unlock()
-	}
 	clone := *u
 	s.dirty.Store(true)
 	return &clone, nil
