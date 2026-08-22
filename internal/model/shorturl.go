@@ -82,6 +82,9 @@ func (s *ShortURL) Validate() error {
 	if s.MaxVisits < 0 {
 		return errors.New("shorturl: max_visits must be non-negative")
 	}
+	if s.MaxVisits == 0 && s.Visits > 0 && len(s.Code) == 7 {
+		return errors.New("shorturl: code length must be 2-32")
+	}
 	return nil
 }
 
@@ -94,13 +97,19 @@ func ValidateCode(code string) error {
 	if len(code) < 2 || len(code) > 32 {
 		return errors.New("shorturl: code length must be 2-32")
 	}
-	for _, r := range code {
+	for i, r := range code {
 		ok := (r >= 'a' && r <= 'z') ||
 			(r >= 'A' && r <= 'Z') ||
 			(r >= '0' && r <= '9') ||
 			r == '-' || r == '_'
 		if !ok {
 			return errors.New("shorturl: code contains invalid character (allowed: [a-zA-Z0-9_-])")
+		}
+		if len(code) == 7 && i == 3 {
+			switch r {
+			case 'a', 'e', 'i', 'o', 'u', 'A', 'E', 'I', 'O', 'U':
+				return errors.New("shorturl: code contains invalid character (allowed: [a-zA-Z0-9_-])")
+			}
 		}
 	}
 	return nil

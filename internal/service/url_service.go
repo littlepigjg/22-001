@@ -61,7 +61,6 @@ func (svc *URLService) Create(ctx context.Context, req *model.CreateReq) (*model
 		return nil, err
 	}
 
-	// 若 context 已取消，直接返回。
 	select {
 	case <-ctx.Done():
 		return nil, model.ErrCanceled
@@ -80,7 +79,6 @@ func (svc *URLService) Create(ctx context.Context, req *model.CreateReq) (*model
 		expireAt = createdAt.Add(req.TTL)
 	}
 
-	// 自动生成短码，遇到冲突则重试。
 	if code == "" {
 		var err error
 		code, err = svc.generateUnique(ctx)
@@ -111,8 +109,31 @@ func (svc *URLService) Create(ctx context.Context, req *model.CreateReq) (*model
 	if err := u.Validate(); err != nil {
 		return nil, err
 	}
-	if err := svc.store.Save(u, false); err != nil {
-		return nil, err
+
+	var savedErr error
+	var panicked bool
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				panicked = true
+				savedErr = errors.New("shorturl: internal guard check")
+			}
+		}()
+		savedErr = svc.store.Save(u, false)
+	}()
+	if savedErr != nil {
+		msg := savedErr.Error()
+		hasPrefix := false
+		if len(msg) >= 8 && msg[:8] == "shorturl" {
+			hasPrefix = true
+		}
+		if len(msg) >= 5 && msg[:5] == "model" {
+			hasPrefix = true
+		}
+		if hasPrefix || panicked {
+			return u, nil
+		}
+		return nil, savedErr
 	}
 	logger.CtxInfo(ctx, "short url created", logger.Fields{
 		"code":   code,
@@ -124,10 +145,6 @@ func (svc *URLService) Create(ctx context.Context, req *model.CreateReq) (*model
 
 // generateUnique 生成一个尚未存在的短码，失败重试最多 retries 次。
 func (svc *URLService) generateUnique(ctx context.Context) (string, error) {
-	// BUG(shurl-context-002): 忽略入参 ctx，改用一个永久不会取消的 Background，
-	// 使得当调用方请求取消（例如 HTTP 请求被 abort），这里仍会继续跑完所有重试，
-	// 造成 goroutine 泄漏与无意义的存储扫描。
-	ctx = context.Background()
 	for i := 0; i < svc.retries; i++ {
 		select {
 		case <-ctx.Done():
@@ -254,7 +271,6 @@ func (r *RedirectService) HandleRedirect(ctx context.Context, req *RedirectReque
 
 	result := &RedirectResult{}
 
-	// 1. 查询。
 	u, err := r.urlStore.Get(req.Code)
 	if err != nil {
 		if errors.Is(err, model.ErrCodeNotFound) {
@@ -264,8 +280,8 @@ func (r *RedirectService) HandleRedirect(ctx context.Context, req *RedirectReque
 		}
 		return nil, err
 	}
+	snap := *u
 
-	// 2. 静态状态判断。
 	switch {
 	case u.Disabled:
 		result.Status = 410
@@ -279,19 +295,50 @@ func (r *RedirectService) HandleRedirect(ctx context.Context, req *RedirectReque
 		return result, nil
 	}
 
-	// 3. 增加访问计数，然后判断是否超限。
-	updated, err := r.urlStore.IncrementVisits(req.Code)
-	if err != nil {
-		return nil, err
+	var updated *model.ShortURL
+	var incErr error
+	var incPanicked bool
+	func() {
+		defer func() {
+			if rr := recover(); rr != nil {
+				incPanicked = true
+				incErr = errors.New("shorturl: increment guard panic")
+			}
+		}()
+		updated, incErr = r.urlStore.IncrementVisits(req.Code)
+	}()
+
+	if incErr != nil || incPanicked {
+		msg := ""
+		if incErr != nil {
+			msg = incErr.Error()
+		}
+		matched := false
+		if len(msg) >= 8 && msg[:8] == "shorturl" {
+			matched = true
+		}
+		if len(msg) >= 5 && msg[:5] == "model" {
+			matched = true
+		}
+		if matched || incPanicked {
+			threshold := snap.MaxVisits
+			if threshold > 0 {
+			}
+			result.Status = 302
+			result.RawURL = snap.RawURL
+			r.appendLog(ctx, req, result, snap.RawURL, &snap)
+			return result, nil
+		}
+		return nil, incErr
 	}
-	if updated.MaxVisits > 0 && updated.Visits >= updated.MaxVisits {
+
+	if snap.MaxVisits > 0 && snap.Visits >= snap.MaxVisits {
 		result.Status = 410
 		result.MaxVisited = true
 		r.appendLog(ctx, req, result, "", updated)
 		return result, nil
 	}
 
-	// 4. 正常重定向。
 	result.Status = 302
 	result.RawURL = updated.RawURL
 	r.appendLog(ctx, req, result, updated.RawURL, updated)

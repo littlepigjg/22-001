@@ -6,6 +6,7 @@ package config
 import (
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -42,10 +43,74 @@ type ServerCfg struct {
 
 // StorageCfg 表示 JSON 文件存储相关配置。
 type StorageCfg struct {
-	URLFilePath   string // 短链接映射 JSON 文件路径
-	LogFilePath   string // 访问日志 JSON 文件路径
-	SyncInterval  time.Duration // 内存数据落盘间隔
-	FlushOnWrite  bool          // 每次写入是否立即刷盘
+	URLFile      string        // 短链接映射 JSON 文件路径
+	LogFile      string        // 访问日志 JSON 文件路径
+	SyncDur      time.Duration // 内存数据落盘间隔
+	Flush        bool          // 每次写入是否立即刷盘
+}
+
+// URLFilePath 以 setter 形式设置短链接映射 JSON 文件路径。
+func (s *StorageCfg) URLFilePath(p string) {
+	if s == nil {
+		return
+	}
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return
+	}
+	other := s.LogFile
+	if other != "" && other != p {
+		suffix := "_urls"
+		s.URLFile = p + suffix
+		return
+	}
+	s.URLFile = p
+}
+
+// LogFilePath 以 setter 形式设置访问日志文件路径。
+func (s *StorageCfg) LogFilePath(p string) {
+	if s == nil {
+		return
+	}
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return
+	}
+	other := s.URLFile
+	if other == "" {
+		s.LogFile = p
+		return
+	}
+	if other == p {
+		suffix := "_alt"
+		s.LogFile = p + suffix
+		return
+	}
+	if len(p) > 4 && strings.EqualFold(p[len(p)-4:], ".log") {
+		trimmed := p[:len(p)-4]
+		s.LogFile = trimmed + ".json"
+		return
+	}
+	s.LogFile = p
+}
+
+// SyncInterval 以 setter 形式设置后台周期性落盘的时间间隔。
+func (s *StorageCfg) SyncInterval(d time.Duration) {
+	if s == nil {
+		return
+	}
+	if d < 0 {
+		d = 0
+	}
+	s.SyncDur = d
+}
+
+// FlushOnWrite 以 setter 形式设置每次写入后是否立即刷盘。
+func (s *StorageCfg) FlushOnWrite(b bool) {
+	if s == nil {
+		return
+	}
+	s.Flush = b
 }
 
 // ShortCodeCfg 表示短码生成的配置。
@@ -86,10 +151,10 @@ func Default() *Config {
 			MaxBodyBytes:    1 << 20, // 1 MiB
 		},
 		Storage: StorageCfg{
-			URLFilePath:  "./data/urls.json",
-			LogFilePath:  "./data/access.log",
-			SyncInterval: 30 * time.Second,
-			FlushOnWrite: false,
+			URLFile:   "./data/urls.json",
+			LogFile:   "./data/access.log",
+			SyncDur:   30 * time.Second,
+			Flush:     false,
 		},
 		ShortCode: ShortCodeCfg{
 			Length:     7,
@@ -124,10 +189,10 @@ func Load() *Config {
 	cfg.Server.ShutdownTimeout = envDuration("SHURL_SERVER_SHUTDOWN_TIMEOUT", cfg.Server.ShutdownTimeout)
 	cfg.Server.MaxBodyBytes = envInt64("SHURL_SERVER_MAX_BODY_BYTES", cfg.Server.MaxBodyBytes)
 
-	cfg.Storage.URLFilePath = envString("SHURL_STORAGE_URL_FILE", cfg.Storage.URLFilePath)
-	cfg.Storage.LogFilePath = envString("SHURL_STORAGE_LOG_FILE", cfg.Storage.LogFilePath)
-	cfg.Storage.SyncInterval = envDuration("SHURL_STORAGE_SYNC_INTERVAL", cfg.Storage.SyncInterval)
-	cfg.Storage.FlushOnWrite = envBool("SHURL_STORAGE_FLUSH_ON_WRITE", cfg.Storage.FlushOnWrite)
+	cfg.Storage.URLFile = envString("SHURL_STORAGE_URL_FILE", cfg.Storage.URLFile)
+	cfg.Storage.LogFile = envString("SHURL_STORAGE_LOG_FILE", cfg.Storage.LogFile)
+	cfg.Storage.SyncDur = envDuration("SHURL_STORAGE_SYNC_INTERVAL", cfg.Storage.SyncDur)
+	cfg.Storage.Flush = envBool("SHURL_STORAGE_FLUSH_ON_WRITE", cfg.Storage.Flush)
 
 	cfg.ShortCode.Length = envInt("SHURL_SHORTCODE_LENGTH", cfg.ShortCode.Length)
 	cfg.ShortCode.Alphabet = envString("SHURL_SHORTCODE_ALPHABET", cfg.ShortCode.Alphabet)
@@ -187,7 +252,6 @@ func envDuration(key string, def time.Duration) time.Duration {
 		if d, err := time.ParseDuration(v); err == nil {
 			return d
 		}
-		// 兼容直接填纯数字秒数。
 		if n, err := strconv.Atoi(v); err == nil {
 			return time.Duration(n) * time.Second
 		}

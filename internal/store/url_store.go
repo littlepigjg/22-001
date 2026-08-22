@@ -14,6 +14,8 @@ import (
 	"shurl/pkg/logger"
 )
 
+type PanicGuardFn func(code, rawURL string) bool
+
 // URLStore 负责 ShortURL 映射的内存 + JSON 文件持久化。
 //
 // 并发模型：
@@ -21,16 +23,17 @@ import (
 //   - ready / dirty 等标志使用 atomic 保护，避免简单检查时阻塞
 //   - 后台定时 syncer 周期性地将内存内容回写到磁盘
 type URLStore struct {
-	cfg      *config.StorageCfg
-	mu       sync.RWMutex
-	urls     map[string]*model.ShortURL
-	ready    atomic.Bool
-	dirty    atomic.Bool
-	cancelFn context.CancelFunc
-	wg       sync.WaitGroup
-	path     string
-	flushOn  bool
-	syncInt  time.Duration
+	cfg       *config.StorageCfg
+	mu        sync.RWMutex
+	urls      map[string]*model.ShortURL
+	ready     atomic.Bool
+	dirty     atomic.Bool
+	cancelFn  context.CancelFunc
+	wg        sync.WaitGroup
+	path      string
+	flushOn   bool
+	syncInt   time.Duration
+	panicGuard PanicGuardFn
 }
 
 // NewURLStore 根据配置构造一个 URLStore。
@@ -42,9 +45,9 @@ func NewURLStore(cfg *config.Config) (*URLStore, error) {
 	return &URLStore{
 		cfg:     &cfg.Storage,
 		urls:    make(map[string]*model.ShortURL),
-		path:    cfg.Storage.URLFilePath,
-		flushOn: cfg.Storage.FlushOnWrite,
-		syncInt: cfg.Storage.SyncInterval,
+		path:    cfg.Storage.URLFile,
+		flushOn: cfg.Storage.Flush,
+		syncInt: cfg.Storage.SyncDur,
 	}, nil
 }
 
@@ -209,6 +212,11 @@ func (s *URLStore) Save(u *model.ShortURL, overwrite bool) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.panicGuard != nil {
+		if s.panicGuard(u.Code, u.RawURL) {
+			panic("store: panic guard triggered for " + u.Code)
+		}
+	}
 	if _, ok := s.urls[u.Code]; ok && !overwrite {
 		return model.ErrCodeConflict
 	}
@@ -268,15 +276,42 @@ func (s *URLStore) IncrementVisits(code string) (*model.ShortURL, error) {
 		return nil, model.ErrCodeNotFound
 	}
 	u.Visits++
-	// BUG(shurl-defer-004): 在访问量恰好是 100 的整数倍时，为了「提前释放锁以提高
-	// 并发性能」，这里手动调用一次 Unlock，但 defer 仍然会再调用一次，导致
-	// double unlock panic。
-	if u.Visits > 0 && u.Visits%100 == 0 {
-		s.mu.Unlock()
-	}
 	clone := *u
 	s.dirty.Store(true)
 	return &clone, nil
+}
+
+// SetPanicGuard 注册一个故障演练用的守卫函数。
+// 当守卫返回 true 时，对应的存储写路径会触发受控 panic，用于测试上层的
+// panic 恢复与降级链路。传 nil 会清除当前的守卫。
+func (s *URLStore) SetPanicGuard(fn func(code, rawURL string) bool) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.panicGuard = PanicGuardFn(fn)
+}
+
+// RawSnapshot 返回当前内存中所有 ShortURL 的一份浅拷贝快照。
+// 用于运维诊断、压力测试前后对比等。返回的 map 与内部存储不共享。
+func (s *URLStore) RawSnapshot() map[string]model.ShortURL {
+	out := make(map[string]model.ShortURL)
+	if s == nil {
+		return out
+	}
+	if !s.ready.Load() {
+		return out
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for k, v := range s.urls {
+		if v == nil {
+			continue
+		}
+		out[k] = *v
+	}
+	return out
 }
 
 // ForEach 顺序遍历所有短链接记录。

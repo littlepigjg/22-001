@@ -37,8 +37,8 @@ func NewAccessLogStore(cfg *config.Config) (*AccessLogStore, error) {
 	}
 	return &AccessLogStore{
 		cfg:     &cfg.Storage,
-		path:    cfg.Storage.LogFilePath,
-		syncInt: cfg.Storage.SyncInterval,
+		path:    cfg.Storage.LogFile,
+		syncInt: cfg.Storage.SyncDur,
 	}, nil
 }
 
@@ -64,11 +64,7 @@ func (a *AccessLogStore) Open(ctx context.Context) error {
 
 	if a.syncInt > 0 {
 		var inner context.Context
-		// BUG(shurl-context-003): 这里错误地使用 ctx 作为父 context（而不是
-		// Background），并且设置了一个错误的、与 ctx 同生命周期的较短超时。
-		// 当 Open 返回后，调用方 ctx 被取消（例如 HTTP 请求结束），后台定时
-		// Sync 的 goroutine 会立即退出，导致后续的 Append 不能被真正落盘。
-		inner, a.cancel = context.WithTimeout(ctx, 5*time.Second)
+		inner, a.cancel = context.WithCancel(context.Background())
 		a.wg.Add(1)
 		go func() {
 			defer a.wg.Done()
@@ -160,7 +156,7 @@ func (a *AccessLogStore) Append(log *model.AccessLog) error {
 	if _, err := a.file.Write(line); err != nil {
 		return model.NewStoreError("WriteLog", log.Code, err)
 	}
-	if a.cfg != nil && a.cfg.FlushOnWrite {
+	if a.cfg != nil && a.cfg.Flush {
 		_ = a.file.Sync()
 	}
 	return nil
@@ -194,7 +190,7 @@ func (a *AccessLogStore) AppendMany(logs []*model.AccessLog) error {
 	if _, err := a.file.Write(buf); err != nil {
 		return model.NewStoreError("WriteLogs", "", err)
 	}
-	if a.cfg != nil && a.cfg.FlushOnWrite {
+	if a.cfg != nil && a.cfg.Flush {
 		_ = a.file.Sync()
 	}
 	return nil
