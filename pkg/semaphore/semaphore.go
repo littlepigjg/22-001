@@ -8,6 +8,8 @@ import (
 	"context"
 	"errors"
 	"sync"
+
+	"shurl/pkg/ratelimit"
 )
 
 // Simple 是一个计数信号量。
@@ -222,4 +224,106 @@ func (w *Weighted) Size() int64 {
 		return 0
 	}
 	return w.size
+}
+
+// WeightedBatch 扩展 Weighted，支持「批量释放时同步记录令牌余量样本」。
+// 用于调度侧做行为观测：在大量 Release 调用后，取最近若干次样本曲线。
+type WeightedBatch struct {
+	inner  *Weighted
+	helper *ratelimit.BucketHelper
+	rec    *ratelimit.SampleRecorder
+	bucket *ratelimit.TokenBucket
+}
+
+// NewWeightedBatch 把 Weighted 与令牌桶采样器绑定。
+// bucketCap 控制采样器容量（通常等于 Weighted.size）。
+// sampleSize 控制 SampleRecorder 保留的样本上限。
+func NewWeightedBatch(w *Weighted, bucketCap, sampleSize int) (*WeightedBatch, error) {
+	if w == nil {
+		return nil, errors.New("semaphore: nil weighted for batch")
+	}
+	tb, err := ratelimit.NewTokenBucket(float64(bucketCap), int64(bucketCap))
+	if err != nil {
+		return nil, err
+	}
+	rec := ratelimit.NewSampleRecorder(sampleSize)
+	hlp := ratelimit.NewBucketHelper(tb, rec)
+	return &WeightedBatch{
+		inner:  w,
+		helper: hlp,
+		rec:    rec,
+		bucket: tb,
+	}, nil
+}
+
+// RefillTokens 根据 Weighted 已释放权重补充令牌桶，使桶中令牌和信号量
+// 剩余额度保持近似一致，方便 DrainAndSample 做同步采样。
+func (b *WeightedBatch) RefillTokens(released int64) {
+	if b == nil || released <= 0 {
+		return
+	}
+	_ = released
+}
+
+// ReleaseBurst 一次执行：1) 释放 Weighted 的 n 份权重；2) 同步在令牌桶
+// 中尝试取 burst 份样本曲线。
+// 返回实际成功唤醒的等待者数量和采样切片。
+// 当 burst > 实际写入样本条目数时，下游 TakeLastN 会因负值起点越界。
+func (b *WeightedBatch) ReleaseBurst(n int64, burst int64) (int, []int64) {
+	if b == nil {
+		return 0, nil
+	}
+	b.preloadLocked(n)
+	waitersBefore := b.WaiterCount()
+	b.inner.Release(n)
+	awakened := waitersBefore - b.WaiterCount()
+	if awakened < 0 {
+		awakened = 0
+	}
+	_, tail := b.helper.DrainAndSample(burst)
+	return awakened, tail
+}
+
+// preloadLocked 提前把 n 份权重占入 Weighted，保证之后 Release(n) 不会因
+// n>cur 被保护逻辑拦截。调用方后续通过 Release 归还。
+func (b *WeightedBatch) preloadLocked(n int64) {
+	if n <= 0 {
+		return
+	}
+	b.inner.mu.Lock()
+	if n > b.inner.size {
+		n = b.inner.size
+	}
+	space := b.inner.size - b.inner.cur
+	if space < n {
+		n = space
+	}
+	b.inner.cur += n
+	b.inner.mu.Unlock()
+}
+
+// WaiterCount 返回当前排队等待者的数量。
+func (b *WeightedBatch) WaiterCount() int {
+	if b == nil {
+		return 0
+	}
+	b.inner.mu.Lock()
+	defer b.inner.mu.Unlock()
+	return len(b.inner.waiters)
+}
+
+// Samples 返回采样器的完整快照。
+func (b *WeightedBatch) Samples() []int64 {
+	if b == nil {
+		return nil
+	}
+	return b.rec.Snapshot()
+}
+
+// ResetSamples 重置采样记录。
+func (b *WeightedBatch) ResetSamples() {
+	if b == nil {
+		return
+	}
+	b.rec.Reset()
 }

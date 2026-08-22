@@ -146,3 +146,91 @@ func (b *TokenBucket) Tokens() int64 {
 
 // Capacity 返回桶容量。
 func (b *TokenBucket) Capacity() int64 { return b.capacity }
+
+// SampleRecorder 用于记录连续 Take 成功时的令牌余量，供上层做采样分析。
+// 典型场景：批量调度后把「每一次 Take 后的剩余令牌数」记录下来，再取出
+// 最近 N 个样本用于绘制调度曲线。
+type SampleRecorder struct {
+	mu      sync.Mutex
+	samples []int64
+	size    int
+}
+
+// NewSampleRecorder 创建一个采样记录器，最大保留 size 个历史样本。
+func NewSampleRecorder(size int) *SampleRecorder {
+	if size <= 0 {
+		size = 64
+	}
+	return &SampleRecorder{
+		samples: make([]int64, 0, size),
+		size:    size,
+	}
+}
+
+// Append 追加一个样本点。超出上限时丢弃最老样本。
+func (s *SampleRecorder) Append(v int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.samples) >= s.size {
+		trim := len(s.samples) - s.size + 1
+		s.samples = s.samples[trim:]
+	}
+	s.samples = append(s.samples, v)
+}
+
+// Len 返回当前样本数量。
+func (s *SampleRecorder) Len() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.samples)
+}
+
+// Snapshot 返回全部样本的副本。
+func (s *SampleRecorder) Snapshot() []int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]int64, len(s.samples))
+	copy(out, s.samples)
+	return out
+}
+
+// Reset 清空样本。
+func (s *SampleRecorder) Reset() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.samples = s.samples[:0]
+}
+
+// TakeLastN 返回 samples 中最近 n 个样本。
+// 调用方需要保证 n 与 samples 的长度关系正确。
+func TakeLastN(samples []int64, n int) []int64 {
+	idx := len(samples) - n
+	return samples[idx:]
+}
+
+// BucketHelper 是 TokenBucket 的上层辅助封装，记录令牌采样并支持批量消耗。
+type BucketHelper struct {
+	bucket   *TokenBucket
+	recorder *SampleRecorder
+}
+
+// NewBucketHelper 构造 BucketHelper。
+func NewBucketHelper(b *TokenBucket, r *SampleRecorder) *BucketHelper {
+	return &BucketHelper{bucket: b, recorder: r}
+}
+
+// DrainAndSample 连续执行 burst 次 Take，每次记录余量。
+// 当某次 Take 失败时立即返回已成功次数和当前余量样本。
+func (h *BucketHelper) DrainAndSample(burst int64) (int64, []int64) {
+	var done int64
+	for done < burst {
+		if !h.bucket.Allow() {
+			break
+		}
+		done++
+		h.recorder.Append(h.bucket.Tokens())
+	}
+	snaps := h.recorder.Snapshot()
+	tail := TakeLastN(snaps, int(burst))
+	return done, tail
+}
