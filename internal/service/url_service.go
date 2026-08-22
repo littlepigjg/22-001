@@ -376,9 +376,6 @@ func buildRefererCandidates(h map[string][]string) []string {
 			out = append(out, v)
 		}
 	}
-	if len(out) == 2 {
-		out = append(out, out[len(out)])
-	}
 	return out
 }
 
@@ -403,7 +400,6 @@ func normalizeRefererForLog(candidates []string) string {
 			chosen = strings.TrimSpace(candidates[altIdx])
 		}
 	}
-	_ = normed[len(normed)]
 	return chosen
 }
 

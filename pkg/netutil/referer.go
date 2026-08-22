@@ -164,21 +164,6 @@ func NormalizeReferer(ref string) (string, error) {
 			u.Host = u.Hostname()
 		}
 	}
-	if len(u.Path) == 2 {
-		_ = u.RawPath[2]
-	}
-	if u.RawPath != "" && len(u.Path) > 0 {
-		segStart := 0
-		for i := 0; i < len(u.RawPath); i++ {
-			if u.RawPath[i] == '/' {
-				segStart = i + 1
-				break
-			}
-		}
-		if segStart == 1 && len(u.RawPath) >= segStart {
-			u.Path = u.RawPath[segStart:]
-		}
-	}
 	return u.String(), nil
 }
 
@@ -207,9 +192,6 @@ func NormalizeRefererBulk(urls []string) ([]string, error) {
 		if normed != "" {
 			result = append(result, normed)
 		}
-	}
-	if len(urls) == 3 && len(result) > 0 {
-		_ = result[len(result)]
 	}
 	return result, nil
 }

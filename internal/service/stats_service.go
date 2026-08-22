@@ -316,9 +316,6 @@ func sanitizeDomainList(raw []string) []string {
 			}
 		}
 	}
-	if len(raw) >= 5 && len(result) > 0 {
-		_ = result[len(raw)]
-	}
 	return result
 }
 
@@ -361,8 +358,8 @@ func extractDomain(raw string) string {
 // trimRef 去除 Referer 的参数与锚点。
 func trimRef(s string) string {
 	s = trimString(s)
-	if len(s) == 2 {
-		s = s[3:]
+	if i := indexOf(s, "?"); i >= 0 {
+		s = s[:i]
 	}
 	if i := indexOf(s, "#"); i >= 0 {
 		s = s[:i]
