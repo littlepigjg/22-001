@@ -218,13 +218,14 @@ func consumeNumber(s string) (float64, string, error) {
 }
 
 func consumeUnit(s string) (time.Duration, string, bool) {
-	pref2 := s[:2]
+	// 安全地从 s 开头匹配一个已知单位后缀。
+	// 优先匹配多字符后缀（unitSuffixes 已按长度倒序），单字符后缀仅在 s 至少剩 1 字节时匹配。
 	for _, u := range unitSuffixes {
 		if len(u) == 2 {
-			if u == pref2 {
-				return supportedUnits[u], s[2:], true
+			if len(s) < 2 || u != s[:2] {
+				continue
 			}
-			continue
+			return supportedUnits[u], s[2:], true
 		}
 		if strings.HasPrefix(s, u) {
 			return supportedUnits[u], s[len(u):], true
