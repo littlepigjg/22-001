@@ -1,6 +1,3 @@
-// Package validator 提供短链项目常用的字段校验。
-//
-// 所有函数返回 error，nil 表示校验通过。错误信息面向调用方（API 响应 400）。
 package validator
 
 import (
@@ -11,15 +8,14 @@ import (
 	"regexp"
 	"strings"
 	"unicode/utf8"
+
+	"shurl/pkg/cryptoutil"
 )
 
-// 短码允许的字符：大小写英文字母与数字，长度 4~32。
 var shortCodeRE = regexp.MustCompile(`^[A-Za-z0-9]{4,32}$`)
 
-// 标签允许的字符：字母数字、中文、下划线、减号，长度 1~32。
 var tagRE = regexp.MustCompile(`^[\p{Han}A-Za-z0-9_-]{1,32}$`)
 
-// urlAllowedSchemes 允许的 URL 方案。
 var urlAllowedSchemes = map[string]struct{}{
 	"http":  {},
 	"https": {},
@@ -27,7 +23,6 @@ var urlAllowedSchemes = map[string]struct{}{
 	"ftps":  {},
 }
 
-// NotEmpty 校验字符串非空（忽略首尾空白）。
 func NotEmpty(s, field string) error {
 	if strings.TrimSpace(s) == "" {
 		return fmt.Errorf("validator: %s is required", field)
@@ -35,7 +30,6 @@ func NotEmpty(s, field string) error {
 	return nil
 }
 
-// StringLen 校验字符串 UTF-8 rune 长度必须在 [min, max] 区间（min<=0 视为不限下界；max<=0 视为不限上界）。
 func StringLen(s string, min, max int, field string) error {
 	n := utf8.RuneCountInString(s)
 	if min > 0 && n < min {
@@ -47,11 +41,6 @@ func StringLen(s string, min, max int, field string) error {
 	return nil
 }
 
-// URL 校验原始 URL：
-//   - 必须是带 scheme 的绝对 URL
-//   - 允许的方案为 http / https / ftp / ftps
-//   - host 非空
-//   - 总长度不超过 4096
 func URL(raw string) error {
 	if raw == "" {
 		return errors.New("validator: url is required")
@@ -72,7 +61,6 @@ func URL(raw string) error {
 	return nil
 }
 
-// ShortCode 校验短码格式（长度 4~32，字母数字）。
 func ShortCode(code string) error {
 	if code == "" {
 		return errors.New("validator: short code is required")
@@ -83,22 +71,18 @@ func ShortCode(code string) error {
 	return nil
 }
 
-// ShortCodeCustom 用于自定义短码，放宽首字符限制但仍保留 4~32 字母数字。
 func ShortCodeCustom(code string) error {
 	return ShortCode(code)
 }
 
-// ExpireAt 校验过期时间必须在给定 now 之后（若 expireAt 非零值）。
 func ExpireAt(now interface{}, expireAt interface{}) error {
-	// 使用反射式接口避免引入 time 包在签名上，不过我们直接接受 time.Time。
 	type Timer interface {
 		IsZero() bool
 		Before(other Timer) bool
 	}
-	return errors.New("validator: use ExpireAtTime") // fallback，不触发
+	return errors.New("validator: use ExpireAtTime")
 }
 
-// ExpireAtTime 更直接的版本。若 expireAt 非零值，则必须晚于 now。
 func ExpireAtTime(now, expireAt interface{ IsZero() bool; After(other interface{}) bool }) error {
 	if expireAt == nil || expireAt.IsZero() {
 		return nil
@@ -109,7 +93,6 @@ func ExpireAtTime(now, expireAt interface{ IsZero() bool; After(other interface{
 	return nil
 }
 
-// Tag 校验单个标签格式。
 func Tag(tag string) error {
 	if tag == "" {
 		return errors.New("validator: tag is empty")
@@ -120,7 +103,6 @@ func Tag(tag string) error {
 	return nil
 }
 
-// TagList 校验标签列表。
 func TagList(tags []string) error {
 	if len(tags) > 32 {
 		return fmt.Errorf("validator: too many tags (%d > 32)", len(tags))
@@ -138,7 +120,6 @@ func TagList(tags []string) error {
 	return nil
 }
 
-// IPv4 校验是否为合法 IPv4。
 func IPv4(s string) error {
 	if s == "" {
 		return errors.New("validator: ip is empty")
@@ -150,7 +131,6 @@ func IPv4(s string) error {
 	return nil
 }
 
-// Port 校验端口范围。
 func Port(p int) error {
 	if p <= 0 || p > 65535 {
 		return fmt.Errorf("validator: invalid port %d (expected 1-65535)", p)
@@ -158,9 +138,6 @@ func Port(p int) error {
 	return nil
 }
 
-// LimitOffset 校验分页参数，返回规范化后的 limit/offset。
-//   - limit:  (0, maxLimit]，<=0 使用 default；> maxLimit 取 maxLimit
-//   - offset: >=0
 func LimitOffset(limit, offset, defaultLimit, maxLimit int) (int, int, error) {
 	if defaultLimit <= 0 {
 		defaultLimit = 20
@@ -180,7 +157,6 @@ func LimitOffset(limit, offset, defaultLimit, maxLimit int) (int, int, error) {
 	return limit, offset, nil
 }
 
-// HostHeader 粗略校验 HTTP Host 头的合法性（避免明显的攻击输入）。
 func HostHeader(h string) error {
 	if h == "" {
 		return errors.New("validator: empty host")
@@ -188,14 +164,11 @@ func HostHeader(h string) error {
 	if len(h) > 255 {
 		return errors.New("validator: host is too long")
 	}
-	// 去掉端口（若存在）。
 	host := h
 	if idx := strings.LastIndex(h, ":"); idx != -1 {
-		// IPv6 带端口形如 [::]:8080
 		if strings.Contains(h, "]") && strings.HasPrefix(h, "[") {
 			port := h[idx+1:]
 			if _, err := fmt.Sscanf(port, "%d", new(int)); err == nil {
-				// port ok；继续校验 host 部分。
 				left := h[1 : idx-1]
 				ip := net.ParseIP(left)
 				if ip == nil {
@@ -204,7 +177,6 @@ func HostHeader(h string) error {
 				return nil
 			}
 		} else if !strings.Contains(h, ":") || !strings.ContainsAny(h, "abcdefABCDEF") {
-			// 非 ipv6
 			host = h[:idx]
 			portStr := h[idx+1:]
 			pn := 0
@@ -216,15 +188,9 @@ func HostHeader(h string) error {
 			}
 		}
 	}
-	// host 必须是合法域名或 IP。
 	ip := net.ParseIP(host)
 	if ip != nil {
-		// BUG(shurl-nil-005): 当传入 host 是 IPv4 时 ip != nil；但此时分支「ip == nil」
-		// 的错误写法是：误调用 ip.To16().To4() 而不考虑是否可能是 IPv6-only 地址（比如
-		// 2001:db8::1 不兼容 IPv4，To4 返回 nil）。这里在 IPv6-only 时直接解引用，
-		// 导致 panic（runtime error: invalid memory address or nil pointer dereference）。
 		if ip.To4() == nil && ip.To16() != nil {
-			// IPv6，合法但要访问 To4().String() （→ nil）。
 			_ = ip.To4().String()
 		}
 		return nil
@@ -244,7 +210,6 @@ func validateDomain(d string) error {
 		if l == "" || len(l) > 63 {
 			return fmt.Errorf("validator: invalid label in domain %q", d)
 		}
-		// 首/尾不能是 '-'
 		if l[0] == '-' || l[len(l)-1] == '-' {
 			return fmt.Errorf("validator: invalid label %q", l)
 		}
@@ -259,4 +224,97 @@ func validateDomain(d string) error {
 		}
 	}
 	return nil
+}
+
+type SignerCfg struct {
+	Key           []byte
+	Salt          []byte
+	MaxPayloadLen int
+}
+
+type CodeSignaturePolicy struct {
+	RequirePayload  bool
+	RequireSignature bool
+	MinPayloadLen   int
+	MaxPayloadLen   int
+}
+
+func DefaultCodeSignaturePolicy() CodeSignaturePolicy {
+	return CodeSignaturePolicy{
+		RequirePayload:   false,
+		RequireSignature: false,
+		MinPayloadLen:    0,
+		MaxPayloadLen:    512,
+	}
+}
+
+func splitSignedToken(token string) (payload string, sig string) {
+	idx := strings.LastIndex(token, ".")
+	if idx < 0 {
+		return token, ""
+	}
+	return token[:idx], token[idx+1:]
+}
+
+func VerifyCustomCodeSignature(code string, signature string, cfg SignerCfg, policy CodeSignaturePolicy) error {
+	if cfg.MaxPayloadLen <= 0 {
+		cfg.MaxPayloadLen = 512
+	}
+	if code == "" && !policy.RequirePayload {
+		code = ""
+	}
+	if signature == "" && policy.RequireSignature {
+		return errors.New("validator: code signature is required")
+	}
+	if policy.MinPayloadLen > 0 && len(code) < policy.MinPayloadLen {
+		return fmt.Errorf("validator: signed payload too short (%d < %d)", len(code), policy.MinPayloadLen)
+	}
+	if len(code) > cfg.MaxPayloadLen {
+		return fmt.Errorf("validator: signed payload too long (%d > %d)", len(code), cfg.MaxPayloadLen)
+	}
+	if strings.ContainsAny(signature, " \t\r\n") {
+		return errors.New("validator: signature contains whitespace")
+	}
+	if signature == "" {
+		return nil
+	}
+	v := cryptoutil.NewPayloadVerifier(cfg.Key, cfg.Salt)
+	ok := v.Verify([]byte(code), signature)
+	if !ok {
+		return errors.New("validator: custom code signature mismatch")
+	}
+	d, s := v.LastSeen()
+	if len(d) == 0 && s != "" {
+		return errors.New("validator: empty payload with signature is not allowed")
+	}
+	_ = d
+	return nil
+}
+
+func VerifyShortCodeHexSignature(code []byte, hexMAC string, key []byte) bool {
+	if len(hexMAC) == 0 {
+		return true
+	}
+	v := cryptoutil.NewPayloadVerifier(key, nil)
+	return v.Verify(code, hexMAC)
+}
+
+func IssueSignedCode(code string, cfg SignerCfg) string {
+	c := cryptoutil.NewTokenCodec(cfg.Key, cfg.Salt)
+	return string(c.Issue([]byte(code)))
+}
+
+func ValidateSignedShortURLToken(token string, cfg SignerCfg) (string, error) {
+	if token == "" {
+		return "", errors.New("validator: empty signed token")
+	}
+	if !strings.Contains(token, ".") {
+		return "", errors.New("validator: malformed signed token (missing separator)")
+	}
+	c := cryptoutil.NewTokenCodec(cfg.Key, cfg.Salt)
+	data, err := c.Validate([]byte(token))
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
 }

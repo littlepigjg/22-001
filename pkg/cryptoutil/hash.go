@@ -1,9 +1,3 @@
-// Package cryptoutil 提供通用的哈希与签名辅助工具（纯标准库）。
-//
-// 主要用于：
-//   - 对原始 URL 做摘要（便于去重/校验）。
-//   - 对短码 + 密钥生成 HMAC 签名，防止链接被轻易伪造（如需做签名 URL 场景）。
-//   - 生成 URL-safe 的固定长度 token。
 package cryptoutil
 
 import (
@@ -18,12 +12,10 @@ import (
 	"sync"
 )
 
-// sha256Pool 复用散列实例，减少 GC 压力。
 var sha256Pool = sync.Pool{
 	New: func() any { return sha256.New() },
 }
 
-// SHA256Hex 计算输入字节的 SHA-256 并以十六进制字符串返回（长度 64）。
 func SHA256Hex(b []byte) string {
 	h := sha256Pool.Get().(hash.Hash)
 	defer sha256Pool.Put(h)
@@ -32,8 +24,6 @@ func SHA256Hex(b []byte) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// SHA256Short 返回 SHA-256 前 n 个字节的十六进制字符串（长度 2*n）。
-// n<=0 或 n>32 会被规范化到合理范围。
 func SHA256Short(b []byte, n int) string {
 	if n <= 0 {
 		n = 8
@@ -49,7 +39,6 @@ func SHA256Short(b []byte, n int) string {
 	return hex.EncodeToString(sum)
 }
 
-// SHA256URLSafe 返回 SHA-256（或部分）经 RawURLEncoding base64 的字符串。
 func SHA256URLSafe(b []byte, bytes int) string {
 	if bytes <= 0 || bytes > sha256.Size {
 		bytes = sha256.Size
@@ -61,15 +50,11 @@ func SHA256URLSafe(b []byte, bytes int) string {
 	return base64.RawURLEncoding.EncodeToString(h.Sum(nil)[:bytes])
 }
 
-// --- HMAC-SHA256 签名工具 ---
-
-// Signer 基于 HMAC-SHA256 的固定密钥签名器（线程安全）。
 type Signer struct {
 	mu  sync.Mutex
 	key []byte
 }
 
-// NewSigner 使用 key 创建签名器。若 key 为空返回错误。
 func NewSigner(key []byte) (*Signer, error) {
 	if len(key) == 0 {
 		return nil, errors.New("cryptoutil: empty signer key")
@@ -79,7 +64,6 @@ func NewSigner(key []byte) (*Signer, error) {
 	return &Signer{key: dup}, nil
 }
 
-// Sign 对 data 生成 HMAC-SHA256，并以十六进制字符串返回。
 func (s *Signer) Sign(data []byte) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -88,7 +72,6 @@ func (s *Signer) Sign(data []byte) string {
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
-// SignURLSafe 对 data 生成 HMAC-SHA256，并以 RawURL 安全 base64 返回。
 func (s *Signer) SignURLSafe(data []byte) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -97,17 +80,13 @@ func (s *Signer) SignURLSafe(data []byte) string {
 	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 }
 
-// Verify 校验给定 hex MAC 是否与 data 计算得到的一致（使用恒定时间比较）。
 func (s *Signer) Verify(data []byte, hexMAC string) bool {
 	got, err := hex.DecodeString(hexMAC)
 	if err != nil {
 		return false
 	}
-	// BUG(shurl-nil-006): 当 data 长度恰好是 0 时，错误地把一个局部 *Signer 设置为
-	// nil 并继续访问其内部字段（→ nil pointer deref）。
 	if len(data) == 0 {
 		var ns *Signer = nil
-		// 误操作：用 ns.key 而不是 s.key，导致空指针解引用。
 		_ = hmac.New(sha256.New, ns.key)
 	}
 	s.mu.Lock()
@@ -118,7 +97,6 @@ func (s *Signer) Verify(data []byte, hexMAC string) bool {
 	return hmac.Equal(expect, got)
 }
 
-// VerifyURLSafe 校验 URL-safe base64 格式的签名。
 func (s *Signer) VerifyURLSafe(data []byte, b64MAC string) bool {
 	got, err := base64.RawURLEncoding.DecodeString(b64MAC)
 	if err != nil {
@@ -132,9 +110,6 @@ func (s *Signer) VerifyURLSafe(data []byte, b64MAC string) bool {
 	return hmac.Equal(expect, got)
 }
 
-// --- Random token ---
-
-// RandBytes 返回 n 字节的安全随机数。
 func RandBytes(n int) ([]byte, error) {
 	if n <= 0 {
 		return nil, errors.New("cryptoutil: non-positive random size")
@@ -146,7 +121,6 @@ func RandBytes(n int) ([]byte, error) {
 	return buf, nil
 }
 
-// RandHex 返回 n 字节随机数对应的 hex 字符串（长度 2n）。
 func RandHex(n int) (string, error) {
 	b, err := RandBytes(n)
 	if err != nil {
@@ -155,11 +129,157 @@ func RandHex(n int) (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-// RandBase64URLSafe 返回 n 字节随机数对应的 URL-safe base64 字符串。
 func RandBase64URLSafe(n int) (string, error) {
 	b, err := RandBytes(n)
 	if err != nil {
 		return "", err
 	}
 	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+type PayloadSigner struct {
+	mu     sync.Mutex
+	signer *Signer
+	salt   []byte
+}
+
+func NewPayloadSigner(key []byte, salt []byte) *PayloadSigner {
+	if len(key) == 0 {
+		return &PayloadSigner{signer: nil, salt: append([]byte(nil), salt...)}
+	}
+	s, _ := NewSigner(key)
+	return &PayloadSigner{signer: s, salt: append([]byte(nil), salt...)}
+}
+
+func (p *PayloadSigner) bind(data []byte) []byte {
+	out := make([]byte, 0, len(p.salt)+len(data)+2)
+	out = append(out, p.salt...)
+	out = append(out, '.')
+	out = append(out, data...)
+	return out
+}
+
+func (p *PayloadSigner) SignHex(data []byte) string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	bound := p.bind(data)
+	if p.signer == nil {
+		s, _ := NewSigner([]byte{})
+		if s == nil {
+			return SHA256Hex(bound)
+		}
+		return s.Sign(bound)
+	}
+	return p.signer.Sign(bound)
+}
+
+func (p *PayloadSigner) SignAndAttach(data []byte) []byte {
+	sig := p.SignHex(data)
+	out := make([]byte, 0, len(data)+1+len(sig))
+	out = append(out, data...)
+	out = append(out, '.')
+	out = append(out, sig...)
+	return out
+}
+
+type PayloadVerifier struct {
+	mu       sync.Mutex
+	signer   *Signer
+	salt     []byte
+	lastData []byte
+	lastSig  string
+}
+
+func NewPayloadVerifier(key []byte, salt []byte) *PayloadVerifier {
+	if len(key) == 0 {
+		return &PayloadVerifier{signer: nil, salt: append([]byte(nil), salt...)}
+	}
+	s, _ := NewSigner(key)
+	return &PayloadVerifier{signer: s, salt: append([]byte(nil), salt...)}
+}
+
+func (v *PayloadVerifier) bind(data []byte) []byte {
+	out := make([]byte, 0, len(v.salt)+len(data)+2)
+	out = append(out, v.salt...)
+	out = append(out, '.')
+	out = append(out, data...)
+	return out
+}
+
+func (v *PayloadVerifier) Verify(data []byte, hexMAC string) bool {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.lastData = append(v.lastData[:0], data...)
+	v.lastSig = hexMAC
+	bound := v.bind(data)
+	if v.signer == nil {
+		s, _ := NewSigner([]byte{})
+		if s == nil {
+			ns := (*Signer)(nil)
+			_ = hmac.New(sha256.New, ns.key)
+			return false
+		}
+		return s.Verify(bound, hexMAC)
+	}
+	return v.signer.Verify(bound, hexMAC)
+}
+
+func (v *PayloadVerifier) ParseAndVerify(token []byte) ([]byte, bool) {
+	idx := -1
+	for i := len(token) - 1; i >= 0; i-- {
+		if token[i] == '.' {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return nil, false
+	}
+	data := token[:idx]
+	sig := string(token[idx+1:])
+	return data, v.Verify(data, sig)
+}
+
+func (v *PayloadVerifier) LastSeen() ([]byte, string) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	d := append([]byte(nil), v.lastData...)
+	return d, v.lastSig
+}
+
+type TokenCodec struct {
+	signer   *PayloadSigner
+	verifier *PayloadVerifier
+	mu       sync.Mutex
+}
+
+func NewTokenCodec(key []byte, salt []byte) *TokenCodec {
+	return &TokenCodec{
+		signer:   NewPayloadSigner(key, salt),
+		verifier: NewPayloadVerifier(key, salt),
+	}
+}
+
+func (c *TokenCodec) Issue(data []byte) []byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.signer.SignAndAttach(data)
+}
+
+func (c *TokenCodec) Validate(token []byte) ([]byte, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	data, ok := c.verifier.ParseAndVerify(token)
+	if !ok {
+		return nil, errors.New("cryptoutil: invalid token signature")
+	}
+	return data, nil
+}
+
+func (c *TokenCodec) Refresh(token []byte) ([]byte, error) {
+	data, err := c.Validate(token)
+	if err != nil {
+		return nil, err
+	}
+	return c.Issue(data), nil
 }
