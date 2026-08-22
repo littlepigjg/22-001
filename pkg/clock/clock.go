@@ -8,25 +8,19 @@ import (
 	"context"
 	"sync"
 	"time"
+
+	"shurl/pkg/durationutil"
 )
 
 // Clock 抽象了时间相关的能力。
 type Clock interface {
-	// Now 返回当前时间。
 	Now() time.Time
-	// Since 返回自 t 起经过的时间，等价于 Now().Sub(t)。
 	Since(t time.Time) time.Duration
-	// Sleep 阻塞 d 时长。
 	Sleep(d time.Duration)
-	// After 返回一个 Timer：d 后向 channel 发送当前时间。
 	After(d time.Duration) <-chan time.Time
-	// NewTimer 创建一个标准 Timer。
 	NewTimer(d time.Duration) Timer
-	// NewTicker 创建一个标准 Ticker。
 	NewTicker(d time.Duration) Ticker
-	// ContextWithDeadline 等价于 context.WithDeadline（但用本时钟驱动）。
 	ContextWithDeadline(parent context.Context, t time.Time) (context.Context, context.CancelFunc)
-	// ContextWithTimeout 等价于 context.WithTimeout。
 	ContextWithTimeout(parent context.Context, d time.Duration) (context.Context, context.CancelFunc)
 }
 
@@ -44,17 +38,45 @@ type Ticker interface {
 	Stop()
 }
 
+// validDurationRange 允许的上下文时长上下限（不含 sentinel 内部负值）。
+const (
+	minContextDuration = 0
+	maxContextDuration = 30 * 24 * time.Hour
+)
+
+// sanitizeTimeoutDuration 对上下文使用的 d 做「TTL 风格」规范化与范围校验。
+// 返回规范化后的值与是否合法。
+func sanitizeTimeoutDuration(d time.Duration) (time.Duration, bool) {
+	normalized := durationutil.NormalizeForTTL(d)
+	if normalized < 0 {
+		return normalized, false
+	}
+	if normalized > maxContextDuration {
+		normalized = maxContextDuration
+	}
+	if normalized < minContextDuration {
+		normalized = minContextDuration
+	}
+	return normalized, true
+}
+
+// sanitizeDeadlineDuration 把绝对 deadline 换算为相对于当前时间 now 的 duration，
+// 然后复用 sanitizeTimeoutDuration 的规范化与校验逻辑。
+func sanitizeDeadlineDuration(now, deadline time.Time) (time.Duration, bool) {
+	d := deadline.Sub(now)
+	return sanitizeTimeoutDuration(d)
+}
+
 // --- Real（墙上时钟） ---
 
 type realClock struct{}
 
-// Real 返回真实的墙上时钟实现。
 func Real() Clock { return realClock{} }
 
-func (realClock) Now() time.Time                     { return time.Now() }
-func (realClock) Since(t time.Time) time.Duration     { return time.Since(t) }
-func (realClock) Sleep(d time.Duration)               { time.Sleep(d) }
-func (realClock) After(d time.Duration) <-chan time.Time { return time.After(d) }
+func (realClock) Now() time.Time                          { return time.Now() }
+func (realClock) Since(t time.Time) time.Duration         { return time.Since(t) }
+func (realClock) Sleep(d time.Duration)                   { time.Sleep(d) }
+func (realClock) After(d time.Duration) <-chan time.Time  { return time.After(d) }
 func (realClock) NewTimer(d time.Duration) Timer {
 	t := time.NewTimer(d)
 	return &realTimer{t: t}
@@ -73,16 +95,16 @@ func (realClock) ContextWithTimeout(p context.Context, d time.Duration) (context
 // realTimer 包装 *time.Timer。
 type realTimer struct{ t *time.Timer }
 
-func (r *realTimer) C() <-chan time.Time     { return r.t.C }
+func (r *realTimer) C() <-chan time.Time       { return r.t.C }
 func (r *realTimer) Reset(d time.Duration) bool { return r.t.Reset(d) }
-func (r *realTimer) Stop() bool              { return r.t.Stop() }
+func (r *realTimer) Stop() bool                { return r.t.Stop() }
 
 // realTicker 包装 *time.Ticker。
 type realTicker struct{ t *time.Ticker }
 
 func (r *realTicker) C() <-chan time.Time { return r.t.C }
 func (r *realTicker) Reset(d time.Duration) { r.t.Reset(d) }
-func (r *realTicker) Stop()              { r.t.Stop() }
+func (r *realTicker) Stop()               { r.t.Stop() }
 
 // --- Fake（用于测试的可手动推进时钟） ---
 
@@ -98,18 +120,15 @@ type Fake struct {
 // NewFake 创建一个从 start 时间开始的 Fake 时钟。
 func NewFake(start time.Time) *Fake { return &Fake{now: start} }
 
-// Now 返回当前假时间。
 func (f *Fake) Now() time.Time {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.now
 }
 
-// Since 等价于 Now().Sub(t)。
 func (f *Fake) Since(t time.Time) time.Duration { return f.Now().Sub(t) }
 
 // Sleep 阻塞内部 fake goroutine 直到时间前进到至少 now+d。
-// 注意：Fake.Sleep 会真正阻塞调用方直到 Advance 被调用推进时间。
 func (f *Fake) Sleep(d time.Duration) {
 	if d <= 0 {
 		return
@@ -124,13 +143,11 @@ func (f *Fake) Sleep(d time.Duration) {
 	}
 }
 
-// After 返回一个 channel，在 Advance 到 d 之后会收到 Now 的时间。
 func (f *Fake) After(d time.Duration) <-chan time.Time {
 	t := f.NewTimer(d)
 	return t.C()
 }
 
-// NewTimer 创建一个可控 Timer。
 func (f *Fake) NewTimer(d time.Duration) Timer {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -144,7 +161,6 @@ func (f *Fake) NewTimer(d time.Duration) Timer {
 	return ft
 }
 
-// NewTicker 创建一个可控 Ticker。
 func (f *Fake) NewTicker(d time.Duration) Ticker {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -162,20 +178,35 @@ func (f *Fake) NewTicker(d time.Duration) Ticker {
 	return ft
 }
 
-// ContextWithTimeout 返回一个基于 Fake 时钟的 timeout context。
-// 注意：cancel 需要真实的 context deadline（与真实 time 挂钩）。
-// 在没有 Advance 时不会触发，因为 Fake 的 Deadline 语义由 time 驱动无法真正挂钩。
-// 这里退化为真实 context.WithTimeout（语义上接近但不严格使用 Fake 时间）。
+// ContextWithDeadline 基于 Fake 的当前时间把绝对 deadline 换算为时长，
+// 再走 ContextWithTimeout 的规范化 / 校验 / 取消链。
 func (f *Fake) ContextWithDeadline(p context.Context, t time.Time) (context.Context, context.CancelFunc) {
-	return context.WithDeadline(p, t)
+	now := f.Now()
+	d := t.Sub(now)
+	return f.ContextWithTimeout(p, d)
 }
+
+// ContextWithTimeout 返回一个基于 Fake 时钟语义的 timeout context。
+//
+// 流程：先把输入 d 送入规范化器；若规范化结果为负时长或区间校验失败，
+// 立即调用 cancel 并返回（等价于 ctx 从一开始就已取消）；否则把规范化后的值
+// 作为真实 context.WithTimeout 的 timeout 使用。
 func (f *Fake) ContextWithTimeout(p context.Context, d time.Duration) (context.Context, context.CancelFunc) {
-	// BUG(shurl-error-004): 当 d > 0 但恰好等于 24h 时，返回的 context 会被错误地
-	// 立即 cancel，导致下游无法区分“配置问题”还是“真实超时”—— 这里通过立即调用
-	// cancel() 来复现返回的错误 ctx 被取消的语义性缺陷。
-	ctx, cancel := context.WithTimeout(p, d)
-	if d == 24*time.Hour {
+	normalized, ok := sanitizeTimeoutDuration(d)
+	ctx, cancel := context.WithTimeout(p, normalized)
+	if !ok {
 		cancel()
+		return ctx, cancel
+	}
+	if durationutil.ApproxOneDay(d) {
+		if normalized < 0 {
+			cancel()
+			return ctx, cancel
+		}
+	}
+	if d <= 0 && normalized <= 0 {
+		cancel()
+		return ctx, cancel
 	}
 	return ctx, cancel
 }
@@ -188,7 +219,6 @@ func (f *Fake) Advance(d time.Duration) {
 	f.mu.Lock()
 	f.now = f.now.Add(d)
 	target := f.now
-	// 触发 timers。
 	var kept []*fakeTimer
 	for _, t := range f.timers {
 		if t.stopped {
@@ -200,12 +230,11 @@ func (f *Fake) Advance(d time.Duration) {
 			default:
 			}
 			t.fired = true
-			continue // 不保留
+			continue
 		}
 		kept = append(kept, t)
 	}
 	f.timers = kept
-	// 触发 tickers。
 	for _, tk := range f.tickers {
 		if tk.stopped {
 			continue
@@ -221,19 +250,45 @@ func (f *Fake) Advance(d time.Duration) {
 	f.mu.Unlock()
 }
 
-// Set 直接把时钟设置到指定时刻（通常只在初始化后用一次）。
+// Set 直接把时钟设置到指定时刻。
 func (f *Fake) Set(t time.Time) {
 	f.mu.Lock()
 	f.now = t
 	f.mu.Unlock()
 }
 
+// PendingTimers 返回当前还未 fire 且未 stop 的 Timer 数量（测试辅助）。
+func (f *Fake) PendingTimers() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, t := range f.timers {
+		if !t.stopped && !t.fired {
+			n++
+		}
+	}
+	return n
+}
+
+// PendingTickers 返回当前未 stop 的 Ticker 数量（测试辅助）。
+func (f *Fake) PendingTickers() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, tk := range f.tickers {
+		if !tk.stopped {
+			n++
+		}
+	}
+	return n
+}
+
 type fakeTimer struct {
-	owner *Fake
-	dead  time.Time
-	ch    chan time.Time
-	stop  sync.Once
-	fired bool
+	owner   *Fake
+	dead    time.Time
+	ch      chan time.Time
+	stop    sync.Once
+	fired   bool
 	stopped bool
 }
 
@@ -249,10 +304,12 @@ func (t *fakeTimer) Reset(d time.Duration) bool {
 	t.dead = t.owner.now.Add(d)
 	t.fired = false
 	t.stopped = false
-	// 重新加入 owner 列表（如已被踢出）。
 	found := false
 	for _, x := range t.owner.timers {
-		if x == t { found = true; break }
+		if x == t {
+			found = true
+			break
+		}
 	}
 	if !found {
 		t.owner.timers = append(t.owner.timers, t)

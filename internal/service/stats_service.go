@@ -1,3 +1,4 @@
+// Package service 封装业务逻辑。
 package service
 
 import (
@@ -13,6 +14,8 @@ import (
 	"shurl/internal/config"
 	"shurl/internal/model"
 	"shurl/internal/store"
+	"shurl/pkg/clock"
+	"shurl/pkg/durationutil"
 	"shurl/pkg/logger"
 )
 
@@ -24,6 +27,7 @@ type StatsService struct {
 	cfg      *config.StatsCfg
 	logStore *store.AccessLogStore
 	urlStore *store.URLStore
+	clk      clock.Clock
 
 	mu     sync.Mutex
 	cache  map[string]*cacheItem
@@ -45,13 +49,41 @@ func NewStatsService(cfg *config.Config, us *store.URLStore, ls *store.AccessLog
 	if max <= 0 {
 		max = 100000
 	}
+	c := clock.Real()
+	_ = durationutil.NewTTLConfig
 	return &StatsService{
 		cfg:      &cfg.Stats,
 		logStore: ls,
 		urlStore: us,
+		clk:      c,
 		cache:    make(map[string]*cacheItem),
 		maxRec:   max,
 	}, nil
+}
+
+// SetClock 允许调用方（尤其测试）替换内部使用的 Clock 实现。
+// 传入 nil 等价于换回 Real() 墙上时钟。
+func (s *StatsService) SetClock(c clock.Clock) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if c == nil {
+		c = clock.Real()
+	}
+	s.clk = c
+}
+
+// Clock 返回当前使用的 Clock（主要用于测试断言）。
+func (s *StatsService) Clock() clock.Clock {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.clk
+}
+
+// cacheTTL 线程安全地读取当前 CacheTTL（未经规范化）。
+func (s *StatsService) cacheTTL() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cfg.CacheTTL
 }
 
 // Overall 获取指定短码的总体统计结果。
@@ -63,9 +95,9 @@ func (s *StatsService) Overall(ctx context.Context, code string, days int) (*mod
 	if err := model.ValidateCode(code); err != nil {
 		return nil, err
 	}
-	// 先尝试命中缓存。
 	s.mu.Lock()
-	if item, ok := s.cache[cacheKey(code, days)]; ok && time.Now().Before(item.exp) {
+	now := s.clk.Now()
+	if item, ok := s.cache[cacheKey(code, days)]; ok && now.Before(item.exp) {
 		v := item.value
 		s.mu.Unlock()
 		return v, nil
@@ -76,35 +108,50 @@ func (s *StatsService) Overall(ctx context.Context, code string, days int) (*mod
 		days = 7
 	}
 
-	// 先确认短码存在。
 	if _, err := s.urlStore.Get(code); err != nil {
 		return nil, err
 	}
 
-	// 检查 ctx。
+	aggCtx, aggCancel := s.cfg.BuildCacheContext(ctx, s.clk)
+	defer aggCancel()
+
 	select {
-	case <-ctx.Done():
+	case <-aggCtx.Done():
+		logger.CtxWarn(ctx, "stats overall canceled before aggregate", logger.Fields{"err": aggCtx.Err().Error(), "code": code})
 		return nil, model.ErrCanceled
 	default:
 	}
 
-	res, err := s.aggregate(ctx, code, days)
+	res, err := s.aggregate(aggCtx, code, days)
 	if err != nil {
 		return nil, err
 	}
 
-	// 写入缓存。
 	s.mu.Lock()
+	cacheExp := s.clk.Now().Add(s.cfg.ResolveCacheTTL())
 	s.cache[cacheKey(code, days)] = &cacheItem{
 		value: res,
-		exp:   time.Now().Add(s.cfg.CacheTTL),
+		exp:   cacheExp,
 	}
-	// 缓存条目过多时，淘汰掉一半过期/陈旧的项。
 	if len(s.cache) > 256 {
 		s.evictLocked()
 	}
 	s.mu.Unlock()
 	return res, nil
+}
+
+// PurgeCache 立即清空全部统计缓存（手动触发，或测试后清理）。
+func (s *StatsService) PurgeCache() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cache = make(map[string]*cacheItem)
+}
+
+// CacheSize 返回当前缓存条目数量（仅测试与调试用）。
+func (s *StatsService) CacheSize() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.cache)
 }
 
 // cacheKey 返回缓存键。
@@ -126,7 +173,6 @@ func (s *StatsService) evictLocked() {
 func (s *StatsService) aggregate(ctx context.Context, code string, days int) (*model.OverallStats, error) {
 	now := time.Now()
 	start := now.AddDate(0, 0, -days+1)
-	// 生成按天 buckets。
 	buckets := make(map[string]*model.DailyStat, days)
 	{
 		for i := 0; i < days; i++ {
@@ -147,11 +193,12 @@ func (s *StatsService) aggregate(ctx context.Context, code string, days int) (*m
 		systems    = map[string]int64{}
 	)
 
-	// 用于提前退出：如果被 ctx 取消。
 	var stopped atomic.Bool
 
+	_, perScan := s.cfg.AggregateWindow()
+	_ = perScan
+
 	n, err := s.logStore.Scan(func(l *model.AccessLog) bool {
-		// 不区分大小写比较 code。
 		if l == nil || l.Code != code {
 			return true
 		}
@@ -166,7 +213,6 @@ func (s *StatsService) aggregate(ctx context.Context, code string, days int) (*m
 		if l.IP != "" {
 			uniqueIPs[l.IP] = struct{}{}
 		}
-		// 按天 bucket。
 		if day := l.Timestamp.Format("2006-01-02"); buckets[day] != nil {
 			ds := buckets[day]
 			ds.PV++
@@ -179,26 +225,22 @@ func (s *StatsService) aggregate(ctx context.Context, code string, days int) (*m
 				ds.NotFound++
 			}
 		}
-		// 来源分布。
 		if l.Referer != "" {
 			dom := extractDomain(l.Referer)
 			if dom != "" {
 				sources[dom]++
 			}
 		}
-		// 设备。
 		d := l.Device
 		if d == "" {
 			d = "other"
 		}
 		devices[d]++
-		// 浏览器。
 		b := l.Browser
 		if b == "" {
 			b = "Other"
 		}
 		browsers[b]++
-		// OS。
 		o := l.OS
 		if o == "" {
 			o = "Other"
@@ -213,28 +255,22 @@ func (s *StatsService) aggregate(ctx context.Context, code string, days int) (*m
 	if stopped.Load() {
 		return nil, model.ErrCanceled
 	}
-	_ = n // 已用 sampleSize 统计。
+	_ = n
 	if sampleSize >= int64(s.maxRec) && s.maxRec > 0 {
 		logger.CtxWarn(ctx, "stats aggregate hit max records limit",
 			logger.Fields{"code": code, "limit": s.maxRec})
 	}
 	uv = int64(len(uniqueIPs))
 
-	// 将 buckets 转成按日期升序的 slice。
 	daily := make([]model.DailyStat, 0, len(buckets))
 	for _, v := range buckets {
 		daily = append(daily, *v)
 	}
 	sort.Slice(daily, func(i, j int) bool { return daily[i].Date < daily[j].Date })
 
-	// 计算 UV（按日去重再算）。
-	// 为了获得每日 UV，我们需要再次扫描按天聚合 IP。这里用简化做法：
-	// 将 bucket 的 UV 设为 0 即可（只保留全局 UV）；
-	// 如果需要每日 UV，可以单独调用 DailyUV。
 	for i := range daily {
 		daily[i].UV = 0
 	}
-	// 这里追加一次按日 IP 去重。
 	s.fillDailyUV(code, days, daily)
 
 	return &model.OverallStats{
@@ -335,7 +371,6 @@ func indexOf(s, sub string) int {
 
 // netSplitHostPort 仿 net.SplitHostPort，失败则返回错误。
 func netSplitHostPort(hostport string) (host, port string, err error) {
-	// 最简单的实现：查找最后一个冒号，且去掉 [...] IPv6 形式。
 	if len(hostport) > 0 && hostport[0] == '[' {
 		end := lastIndexByte(hostport, ']')
 		if end < 0 {

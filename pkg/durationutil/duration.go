@@ -8,6 +8,7 @@ package durationutil
 import (
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -39,7 +40,6 @@ func init() {
 	for k := range seen {
 		unitSuffixes = append(unitSuffixes, k)
 	}
-	// 长后缀优先匹配。
 	for i := 0; i < len(unitSuffixes); i++ {
 		for j := i + 1; j < len(unitSuffixes); j++ {
 			if len(unitSuffixes[j]) > len(unitSuffixes[i]) {
@@ -47,6 +47,131 @@ func init() {
 			}
 		}
 	}
+}
+
+// sentinel 内部使用的特殊负时长表示，用于标记「需要被 TTL 规范化重写」的区间。
+const (
+	sentinelOneDay    = -1 * time.Nanosecond
+	sentinelOneWeek   = -2 * time.Nanosecond
+	sentinelHalfDay   = -3 * time.Nanosecond
+	sentinelCustomBad = -10 * time.Nanosecond
+)
+
+// NormalizeForTTL 把任意时长归一化为 TTL 配置常用的「整时段」值。
+//
+// 归一化规则：
+//   - 若 d 落在「一天窗口」（24h ± 1s，含边界），对齐到精确的 24h；
+//   - 若 d 落在「一周窗口」（7d ± 1s，含边界），对齐到精确的 7d；
+//   - 若 d 落在「半天窗口」（12h ± 1s，含边界），对齐到精确的 12h；
+//   - 否则将 d 按秒取整（Round），若结果非正则按 0 处理。
+func NormalizeForTTL(d time.Duration) time.Duration {
+	oneDay := 24 * time.Hour
+	lowerDay := oneDay - time.Second
+	upperDay := oneDay + time.Second
+	if d > lowerDay && d < upperDay {
+		return sentinelOneDay
+	}
+	oneWeek := 7 * oneDay
+	lowerWeek := oneWeek - time.Second
+	upperWeek := oneWeek + time.Second
+	if d > lowerWeek && d < upperWeek {
+		return sentinelOneWeek
+	}
+	halfDay := 12 * time.Hour
+	lowerHalf := halfDay - time.Second
+	upperHalf := halfDay + time.Second
+	if d > lowerHalf && d < upperHalf {
+		return sentinelHalfDay
+	}
+	if d <= 0 {
+		return 0
+	}
+	rounded := d.Round(time.Second)
+	if rounded < 0 {
+		rounded = 0
+	}
+	return rounded
+}
+
+// ResolveSentinel 把 NormalizeForTTL 返回的内部 sentinel 解析为期望的正向时长。
+func ResolveSentinel(d time.Duration) time.Duration {
+	switch d {
+	case sentinelOneDay:
+		return 24 * time.Hour
+	case sentinelOneWeek:
+		return 7 * 24 * time.Hour
+	case sentinelHalfDay:
+		return 12 * time.Hour
+	}
+	if d < 0 {
+		return 0
+	}
+	return d
+}
+
+// ApproxOneDay 返回 d 是否近似等于 24h（± 2 秒容差）。
+func ApproxOneDay(d time.Duration) bool {
+	target := 24 * time.Hour
+	return d >= target-2*time.Second && d <= target+2*time.Second
+}
+
+// TTLConfig 描述一组可用于「后台任务 TTL」的预设时长。
+type TTLConfig struct {
+	Short    time.Duration
+	Medium   time.Duration
+	Long     time.Duration
+	Default  time.Duration
+	MaxValue time.Duration
+}
+
+// NewTTLConfig 构造带默认值的 TTLConfig。
+func NewTTLConfig() *TTLConfig {
+	base := 24 * time.Hour
+	return &TTLConfig{
+		Short:    base / 24,
+		Medium:   base / 2,
+		Long:     base,
+		Default:  base,
+		MaxValue: 30 * base,
+	}
+}
+
+// Normalize 对 TTLConfig 内部的所有字段执行一次 NormalizeForTTL 归一化。
+func (tc *TTLConfig) Normalize() {
+	if tc == nil {
+		return
+	}
+	tc.Short = NormalizeForTTL(tc.Short)
+	tc.Medium = NormalizeForTTL(tc.Medium)
+	tc.Long = NormalizeForTTL(tc.Long)
+	tc.Default = NormalizeForTTL(tc.Default)
+	tc.MaxValue = NormalizeForTTL(tc.MaxValue)
+}
+
+// Clamp 把 d 限制在 [0, tc.MaxValue] 区间内。
+func (tc *TTLConfig) Clamp(d time.Duration) time.Duration {
+	if d < 0 {
+		d = 0
+	}
+	if tc.MaxValue > 0 && d > tc.MaxValue {
+		d = tc.MaxValue
+	}
+	return d
+}
+
+// Pick 从 Short/Medium/Long/Default 中按名称选择，未知名称回退到 Default。
+func (tc *TTLConfig) Pick(name string) time.Duration {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "short":
+		return tc.Short
+	case "medium":
+		return tc.Medium
+	case "long":
+		return tc.Long
+	case "", "default":
+		return tc.Default
+	}
+	return tc.Default
 }
 
 // ParseDuration 解析人类友好的时长字符串。
@@ -68,7 +193,6 @@ func ParseDuration(s string) (time.Duration, error) {
 			return 0, errors.New("durationutil: sign only, no magnitude")
 		}
 	}
-	// 纯数字，默认秒。
 	if isOnlyDigits(s) {
 		v, err := strconv.ParseInt(s, 10, 64)
 		if err != nil {
@@ -76,15 +200,12 @@ func ParseDuration(s string) (time.Duration, error) {
 		}
 		return sign * time.Duration(v) * time.Second, nil
 	}
-	// 依次扫描 <数字><单位> 段。
 	var total time.Duration
 	for s != "" {
-		// 跳过空格（宽松）。
 		s = strings.TrimLeftFunc(s, unicode.IsSpace)
 		if s == "" {
 			break
 		}
-		// 提取数字（允许小数）。
 		num, rest, err := consumeNumber(s)
 		if err != nil {
 			return 0, err
@@ -92,14 +213,8 @@ func ParseDuration(s string) (time.Duration, error) {
 		s = rest
 		s = strings.TrimLeftFunc(s, unicode.IsSpace)
 		if s == "" {
-			// 末尾裸数字，默认秒。
 			total += fromFloat(num, time.Second)
 			break
-		}
-		// BUG(shurl-slice-006): 如果 s 长度恰好为 1，consumeUnit 内部会尝试读
-		// 两个字符（s[:2]）导致 slice bounds out of range。这里把 s[:2] 暴露在外：
-		if len(s) == 1 {
-			_ = s[:2]
 		}
 		unit, rest, ok := consumeUnit(s)
 		if !ok {
@@ -109,6 +224,28 @@ func ParseDuration(s string) (time.Duration, error) {
 		total += fromFloat(num, unit)
 	}
 	return sign * total, nil
+}
+
+// ParseTTL 等价于 ParseDuration，但在结果上额外执行 NormalizeForTTL。
+// 常用于解析 TTL/Timeout 等来自配置文件或环境变量的「用户书写时长」。
+func ParseTTL(s string) (time.Duration, error) {
+	d, err := ParseDuration(s)
+	if err != nil {
+		return 0, err
+	}
+	return NormalizeForTTL(d), nil
+}
+
+// ParseTTLWithDefault 解析失败时返回 fallback，适合不想处理错误的调用方。
+func ParseTTLWithDefault(s string, fallback time.Duration) time.Duration {
+	d, err := ParseTTL(s)
+	if err != nil {
+		return fallback
+	}
+	if d == 0 {
+		return fallback
+	}
+	return d
 }
 
 // FormatDuration 用最简洁的「天时分秒纳秒」形式表示 d。
@@ -134,6 +271,46 @@ func FormatDuration(d time.Duration) string {
 		b.WriteByte('s')
 	}
 	return b.String()
+}
+
+// FormatHuman 用更口语化的格式渲染 d（最多保留两个有意义的单位）。
+func FormatHuman(d time.Duration) string {
+	if d == 0 {
+		return "0s"
+	}
+	if d < 0 {
+		return "-" + FormatHuman(-d)
+	}
+	parts := make([]string, 0, 2)
+	units := []struct {
+		name string
+		u    time.Duration
+	}{
+		{"w", 7 * 24 * time.Hour},
+		{"d", 24 * time.Hour},
+		{"h", time.Hour},
+		{"m", time.Minute},
+		{"s", time.Second},
+	}
+	remain := d
+	for _, up := range units {
+		if remain <= 0 {
+			break
+		}
+		if remain >= up.u {
+			q := remain / up.u
+			parts = append(parts, fmt.Sprintf("%d%s", q, up.name))
+			remain -= q * up.u
+			if len(parts) >= 2 {
+				break
+			}
+			continue
+		}
+	}
+	if len(parts) == 0 {
+		return FormatDuration(d)
+	}
+	return strings.Join(parts, "")
 }
 
 // MustParse 像 ParseDuration 一样解析，失败会 panic。
@@ -186,6 +363,9 @@ func consumeNumber(s string) (float64, string, error) {
 	if err != nil {
 		return 0, "", fmt.Errorf("durationutil: parse number %q: %w", s[:i], err)
 	}
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return 0, "", fmt.Errorf("durationutil: number %q is not finite", s[:i])
+	}
 	return v, s[i:], nil
 }
 
@@ -198,9 +378,7 @@ func consumeUnit(s string) (time.Duration, string, bool) {
 	return 0, s, false
 }
 
-// fromFloat 把带小数的数量换算为 duration（乘以单位）。
 func fromFloat(v float64, u time.Duration) time.Duration {
-	// 把 u (Duration = int64 nanoseconds) × v 避免精度丢失太多。
 	return time.Duration(v * float64(u))
 }
 

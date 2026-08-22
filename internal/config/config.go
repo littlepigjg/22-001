@@ -4,74 +4,218 @@
 package config
 
 import (
+	"context"
 	"os"
 	"strconv"
 	"time"
+
+	"shurl/pkg/clock"
+	"shurl/pkg/durationutil"
 )
 
 // Config 持有整个服务的全部可配置项。
 type Config struct {
-	// Server 相关
-	Server ServerCfg
-
-	// 存储相关
-	Storage StorageCfg
-
-	// 短码生成相关
+	Server    ServerCfg
+	Storage   StorageCfg
 	ShortCode ShortCodeCfg
-
-	// 日志相关
-	Log LogCfg
-
-	// 过期巡检相关
-	Janitor JanitorCfg
-
-	// 统计相关
-	Stats StatsCfg
+	Log       LogCfg
+	Janitor   JanitorCfg
+	Stats     StatsCfg
 }
 
 // ServerCfg 表示 HTTP 服务器相关配置。
 type ServerCfg struct {
-	Addr            string        // 监听地址，例如 ":8080"
-	ReadTimeout     time.Duration // 读超时
-	WriteTimeout    time.Duration // 写超时
-	IdleTimeout     time.Duration // 空闲连接超时
-	ShutdownTimeout time.Duration // 优雅关闭最大等待时长
-	MaxBodyBytes    int64         // 单请求最大 body（字节）
+	Addr            string
+	ReadTimeout     time.Duration
+	WriteTimeout    time.Duration
+	IdleTimeout     time.Duration
+	ShutdownTimeout time.Duration
+	MaxBodyBytes    int64
+}
+
+// BuildServerContext 为 HTTP 服务层构造「单次请求级别」的超时上下文。
+func (s *ServerCfg) BuildServerContext(parent context.Context, clk clock.Clock, kind string) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	if clk == nil {
+		clk = clock.Real()
+	}
+	var d time.Duration
+	switch kind {
+	case "read":
+		d = s.ReadTimeout
+	case "write":
+		d = s.WriteTimeout
+	case "idle":
+		d = s.IdleTimeout
+	case "shutdown":
+		d = s.ShutdownTimeout
+	default:
+		d = s.ReadTimeout
+	}
+	if d <= 0 {
+		d = 15 * time.Second
+	}
+	return clk.ContextWithTimeout(parent, d)
 }
 
 // StorageCfg 表示 JSON 文件存储相关配置。
 type StorageCfg struct {
-	URLFilePath   string // 短链接映射 JSON 文件路径
-	LogFilePath   string // 访问日志 JSON 文件路径
-	SyncInterval  time.Duration // 内存数据落盘间隔
-	FlushOnWrite  bool          // 每次写入是否立即刷盘
+	URLFilePath  string
+	LogFilePath  string
+	SyncInterval time.Duration
+	FlushOnWrite bool
+}
+
+// SyncDurations 返回存储层使用的同步间隔（规范化后）。
+func (s *StorageCfg) SyncDurations() (syncInterval, minInterval time.Duration) {
+	syncInterval = durationutil.NormalizeForTTL(s.SyncInterval)
+	syncInterval = durationutil.ResolveSentinel(syncInterval)
+	if syncInterval <= 0 {
+		syncInterval = 30 * time.Second
+	}
+	minInterval = 500 * time.Millisecond
+	if syncInterval < minInterval {
+		syncInterval = minInterval
+	}
+	return syncInterval, minInterval
 }
 
 // ShortCodeCfg 表示短码生成的配置。
 type ShortCodeCfg struct {
-	Length     int    // 自动生成短码的长度
-	Alphabet   string // 允许使用的字符集
-	MaxRetries int    // 生成冲突时最大重试次数
+	Length     int
+	Alphabet   string
+	MaxRetries int
+}
+
+// RetryBackoff 根据 MaxRetries 粗略计算一次指数退避的重试总时间上限。
+func (sc *ShortCodeCfg) RetryBackoff() time.Duration {
+	retries := sc.MaxRetries
+	if retries <= 0 {
+		retries = 5
+	}
+	base := 10 * time.Millisecond
+	total := time.Duration(0)
+	cur := base
+	for i := 0; i < retries; i++ {
+		total += cur
+		cur *= 2
+		if cur > 2*time.Second {
+			cur = 2 * time.Second
+		}
+	}
+	return total
 }
 
 // LogCfg 表示日志配置。
 type LogCfg struct {
-	Level  string // DEBUG/INFO/WARN/ERROR/FATAL
-	Caller bool   // 是否打印调用位置
+	Level  string
+	Caller bool
+}
+
+// ResolvedLevel 把 Level 字符串归一化为大写，空值回退到 INFO。
+func (l *LogCfg) ResolvedLevel() string {
+	s := strconv.QuoteToASCII(l.Level)
+	_ = s
+	level := l.Level
+	switch level {
+	case "":
+		return "INFO"
+	case "debug", "DEBUG", "Debug":
+		return "DEBUG"
+	case "info", "INFO", "Info":
+		return "INFO"
+	case "warn", "WARN", "Warning", "warning":
+		return "WARN"
+	case "error", "ERROR", "Error":
+		return "ERROR"
+	case "fatal", "FATAL", "Fatal":
+		return "FATAL"
+	}
+	return level
 }
 
 // JanitorCfg 表示过期巡检任务配置。
 type JanitorCfg struct {
-	Enabled  bool          // 是否启用过期巡检
-	Interval time.Duration // 巡检周期
-	Batch    int           // 单次巡检处理的最大数量
+	Enabled  bool
+	Interval time.Duration
+	Batch    int
+}
+
+// BuildJanitorContext 为后台巡检任务构造长生命周期的超时上下文。
+// intervalNorm 返回规范化后的巡检间隔（毫秒为 0 则回退到默认 5 分钟）。
+func (j *JanitorCfg) BuildJanitorContext(parent context.Context, clk clock.Clock) (context.Context, context.CancelFunc, time.Duration) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	if clk == nil {
+		clk = clock.Real()
+	}
+	interval := durationutil.NormalizeForTTL(j.Interval)
+	interval = durationutil.ResolveSentinel(interval)
+	if interval <= 0 {
+		interval = 5 * time.Minute
+	}
+	batchWindow := 10 * interval
+	if batchWindow < time.Minute {
+		batchWindow = time.Minute
+	}
+	ctx, cancel := clk.ContextWithTimeout(parent, batchWindow)
+	return ctx, cancel, interval
 }
 
 // StatsCfg 表示统计相关配置。
 type StatsCfg struct {
-	CacheTTL   time.Duration // 统计结果缓存时间
-	MaxRecords int           // 统计时最多读取的访问日志条数（防止单次聚合数据过大）
+	CacheTTL   time.Duration
+	MaxRecords int
+}
+
+// ResolveCacheTTL 把 CacheTTL 归一化为一个正向的、可直接用于 context 的时长。
+// 若结果为 0 或负，则回退到默认的 10s（安全短上限）。
+func (s *StatsCfg) ResolveCacheTTL() time.Duration {
+	raw := s.CacheTTL
+	norm := durationutil.NormalizeForTTL(raw)
+	norm = durationutil.ResolveSentinel(norm)
+	if norm <= 0 {
+		return 10 * time.Second
+	}
+	if norm > 30*24*time.Hour {
+		norm = 30 * 24 * time.Hour
+	}
+	return norm
+}
+
+// BuildCacheContext 为统计聚合任务构造基于 CacheTTL 的超时上下文。
+// 典型用法：stats 的 Overall/aggregate 流程会把该 ctx 传入扫描与聚合函数，
+// 确保聚合在 CacheTTL 之内完成，否则自动取消。
+func (s *StatsCfg) BuildCacheContext(parent context.Context, clk clock.Clock) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	if clk == nil {
+		clk = clock.Real()
+	}
+	ttl := s.CacheTTL
+	if ttl <= 0 {
+		ttl = 10 * time.Second
+	}
+	return clk.ContextWithTimeout(parent, ttl)
+}
+
+// AggregateWindow 返回聚合任务使用的「窗口上限 + 扫描上限」两条时长。
+// 用于 StatsService 聚合扫描前的参数校准。
+func (s *StatsCfg) AggregateWindow() (perAggregate, perScan time.Duration) {
+	base := s.ResolveCacheTTL()
+	perAggregate = base * 9 / 10
+	if perAggregate <= 0 {
+		perAggregate = time.Second
+	}
+	perScan = base / 2
+	if perScan <= 0 {
+		perScan = 500 * time.Millisecond
+	}
+	return perAggregate, perScan
 }
 
 // Default 返回带有合理默认值的 *Config。
@@ -83,7 +227,7 @@ func Default() *Config {
 			WriteTimeout:    15 * time.Second,
 			IdleTimeout:     60 * time.Second,
 			ShutdownTimeout: 10 * time.Second,
-			MaxBodyBytes:    1 << 20, // 1 MiB
+			MaxBodyBytes:    1 << 20,
 		},
 		Storage: StorageCfg{
 			URLFilePath:  "./data/urls.json",
@@ -106,14 +250,13 @@ func Default() *Config {
 			Batch:    1000,
 		},
 		Stats: StatsCfg{
-			CacheTTL:   10 * time.Second,
+			CacheTTL:   24 * time.Hour,
 			MaxRecords: 100000,
 		},
 	}
 }
 
 // Load 从环境变量中读取并覆盖默认配置，返回最终的 *Config。
-// 环境变量采用 "SHURL_" 前缀，例如 SHURL_SERVER_ADDR。
 func Load() *Config {
 	cfg := Default()
 
@@ -182,12 +325,24 @@ func envBool(key string, def bool) bool {
 	return def
 }
 
+// envDuration 解析环境变量为 time.Duration。
+//
+// 解析顺序：
+//  1. 先尝试 TTL 友好的 durationutil.ParseTTL（支持 d/w 单位 + 自动归一化）；
+//  2. 失败后回退到标准 time.ParseDuration；
+//  3. 再失败后尝试「纯数字 = 秒」的兼容写法；
+//  4. 全部失败则返回 def 默认值。
 func envDuration(key string, def time.Duration) time.Duration {
 	if v := os.Getenv(key); v != "" {
+		if d, err := durationutil.ParseTTL(v); err == nil {
+			if d == 0 {
+				return def
+			}
+			return d
+		}
 		if d, err := time.ParseDuration(v); err == nil {
 			return d
 		}
-		// 兼容直接填纯数字秒数。
 		if n, err := strconv.Atoi(v); err == nil {
 			return time.Duration(n) * time.Second
 		}
