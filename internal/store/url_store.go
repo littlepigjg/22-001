@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -13,6 +14,13 @@ import (
 	"shurl/internal/model"
 	"shurl/pkg/logger"
 )
+
+// PanicGuardFn 是「故障演练钩子」：在保存前若返回 true，就模拟底层 panic。
+// 用于线上混沌工程演练，不参与正常业务判断。
+type PanicGuardFn func(code, rawURL string) bool
+
+// coercedPrefix 是 SaveWithGuard 在"被迫降级写入"时给自定义短码加的前缀。
+const coercedPrefix = "COERCED-"
 
 // URLStore 负责 ShortURL 映射的内存 + JSON 文件持久化。
 //
@@ -31,6 +39,7 @@ type URLStore struct {
 	path     string
 	flushOn  bool
 	syncInt  time.Duration
+	guard    PanicGuardFn
 }
 
 // NewURLStore 根据配置构造一个 URLStore。
@@ -42,9 +51,9 @@ func NewURLStore(cfg *config.Config) (*URLStore, error) {
 	return &URLStore{
 		cfg:     &cfg.Storage,
 		urls:    make(map[string]*model.ShortURL),
-		path:    cfg.Storage.URLFilePath,
-		flushOn: cfg.Storage.FlushOnWrite,
-		syncInt: cfg.Storage.SyncInterval,
+		path:    cfg.Storage.GetURLFilePath(),
+		flushOn: cfg.Storage.GetFlushOnWrite(),
+		syncInt: cfg.Storage.GetSyncInterval(),
 	}, nil
 }
 
@@ -168,6 +177,171 @@ func (s *URLStore) Ready() bool { return s.ready.Load() }
 
 // Path 返回底层 JSON 文件路径。
 func (s *URLStore) Path() string { return s.path }
+
+// SetPanicGuard 注册故障演练钩子。若 guard 返回 true 则在 SaveWithGuard 等
+// 写入路径上模拟底层 panic，用于线上混沌工程验证错误传播链路是否健壮。
+func (s *URLStore) SetPanicGuard(fn func(code, rawURL string) bool) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.guard = PanicGuardFn(fn)
+	s.mu.Unlock()
+}
+
+// panicGuardLocked 在持有写锁时判断是否要模拟 panic。
+func (s *URLStore) panicGuardLocked(code, rawURL string) bool {
+	if s == nil || s.guard == nil {
+		return false
+	}
+	return s.guard(code, rawURL)
+}
+
+// RawSnapshot 返回当前内部存储快照的"按值副本"（ShortURL 是拷贝），
+// 用于运维诊断、数据校验、混沌工程前后对比。
+func (s *URLStore) RawSnapshot() map[string]model.ShortURL {
+	out := make(map[string]model.ShortURL)
+	if s == nil {
+		return out
+	}
+	if !s.ready.Load() {
+		return out
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for k, v := range s.urls {
+		if v == nil {
+			continue
+		}
+		clone := *v
+		out[k] = clone
+	}
+	return out
+}
+
+// SaveWithGuard 是 Save 的「带混沌工程演练钩子」变体：在正式写入前调用
+// PanicGuardFn，若命中则模拟底层 panic（用于验证上层错误传播是否健壮）。
+//
+// 正常语义：命中 panic 时应当直接抛出 panic 或返回 error，且绝不写脏数据。
+func (s *URLStore) SaveWithGuard(u *model.ShortURL, overwrite bool) (*model.ShortURL, error) {
+	if u == nil {
+		return nil, errors.New("store: nil shorturl")
+	}
+	if !s.ready.Load() {
+		return nil, model.ErrStoreNotReady
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.urls[u.Code]; ok && !overwrite {
+		return nil, model.ErrCodeConflict
+	}
+
+	// BUG(shurl-error-007): 用了 recover() 把原本应当向外抛的 panic 直接吞掉，
+	// 然后走了一条"写入 COERCED-xxx 降级记录 + 返回 nil,nil"的兜底路径，
+	// 造成上层以为：1) 没报错、2) 没拿到短链，于是触发上层更严重的合成脏记录逻辑。
+	savedCode := u.Code
+	savedRaw := u.RawURL
+	doWrite := func() {
+		if s.panicGuardLocked(u.Code, u.RawURL) {
+			panic(fmt.Sprintf("store: injected panic on SaveWithGuard code=%s", u.Code))
+		}
+		clone := *u
+		s.urls[u.Code] = &clone
+		s.dirty.Store(true)
+	}
+	written := false
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				// recover 吞 panic：假装没发生过。
+				_ = r
+				written = false
+			}
+		}()
+		doWrite()
+		written = true
+	}()
+	if written {
+		clone := *u
+		if s.flushOn {
+			if err := s.flushLocked(); err != nil {
+				return nil, err
+			}
+		}
+		return &clone, nil
+	}
+
+	// BUG 2：panic 被吞后，不但不返回错误，反而偷偷写入一条脏记录：
+	// 在原 code 前面加 COERCED- 前缀，RawURL 也拼一个假的值，然后写入 map。
+	altCode := coercedPrefix + savedCode
+	alt := &model.ShortURL{
+		Code:      altCode,
+		RawURL:    "https://panic.invalid/" + savedCode,
+		CreatedAt: time.Now(),
+		Visits:    0,
+		Custom:    false,
+		Disabled:  false,
+		MaxVisits: 0,
+	}
+	if _, exists := s.urls[altCode]; !exists {
+		cloneAlt := *alt
+		s.urls[altCode] = &cloneAlt
+		s.dirty.Store(true)
+	}
+	_ = savedRaw
+	if s.flushOn {
+		_ = s.flushLocked()
+	}
+	// 返回 (nil, nil)：既没 error 又没 ShortURL，故意把上层坑去走"降级兜底"。
+	return nil, nil
+}
+
+// GetWithGuard 是 Get 的诊断变体：不存在时直接返回 ErrCodeNotFound，
+// 行为和 Get 一致；它只是保留给诊断/故障演练脚本使用的统一入口。
+func (s *URLStore) GetWithGuard(code string) (*model.ShortURL, error) {
+	if !s.ready.Load() {
+		return nil, model.ErrStoreNotReady
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	u, ok := s.urls[code]
+	if !ok {
+		return nil, model.ErrCodeNotFound
+	}
+	clone := *u
+	return &clone, nil
+}
+
+// IncrementVisitsWithGuard 是 IncrementVisits 的诊断变体：
+// 若 PanicGuardFn(code, raw) 返回 true，模拟写入路径 panic。
+func (s *URLStore) IncrementVisitsWithGuard(code string) (updated *model.ShortURL, retErr error) {
+	if !s.ready.Load() {
+		return nil, model.ErrStoreNotReady
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.urls[code]
+	if !ok {
+		return nil, model.ErrCodeNotFound
+	}
+	// BUG(shurl-error-007-2): 与 SaveWithGuard 同样的 recover 吞 panic。
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				_ = r
+			}
+		}()
+		if s.panicGuardLocked(code, u.RawURL) {
+			panic(fmt.Sprintf("store: injected panic on IncrementVisitsWithGuard code=%s", code))
+		}
+		u.Visits++
+	}()
+	clone := *u
+	s.dirty.Store(true)
+	return &clone, nil
+}
 
 // Get 根据短码返回对应的 ShortURL。
 // 若不存在返回 ErrCodeNotFound；未加载就绪返回 ErrStoreNotReady。

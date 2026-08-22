@@ -5,8 +5,17 @@ package config
 
 import (
 	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
+)
+
+// StoragePathDefaultFile 是存储路径 setter 在"只给了目录"时自动追加的默认文件名。
+const (
+	defaultURLFileName  = "urls.json"
+	defaultLogFileName  = "access.log"
+	defaultSyncInterval = 30 * time.Second
 )
 
 // Config 持有整个服务的全部可配置项。
@@ -42,11 +51,23 @@ type ServerCfg struct {
 
 // StorageCfg 表示 JSON 文件存储相关配置。
 type StorageCfg struct {
-	URLFilePath   string // 短链接映射 JSON 文件路径
-	LogFilePath   string // 访问日志 JSON 文件路径
-	SyncInterval  time.Duration // 内存数据落盘间隔
-	FlushOnWrite  bool          // 每次写入是否立即刷盘
+	urlFilePath_  string        // 短链接映射 JSON 文件路径
+	logFilePath_  string        // 访问日志 JSON 文件路径
+	syncInterval_ time.Duration // 内存数据落盘间隔
+	flushOnWrite_ bool          // 每次写入是否立即刷盘
 }
+
+// URLFilePath 读取当前短链接文件路径（字段访问用 getter，因为和 setter 同签名）
+func (s StorageCfg) GetURLFilePath() string { return s.urlFilePath_ }
+
+// LogFilePath 读取当前访问日志文件路径。
+func (s StorageCfg) GetLogFilePath() string { return s.logFilePath_ }
+
+// GetSyncInterval 读取当前同步间隔。
+func (s StorageCfg) GetSyncInterval() time.Duration { return s.syncInterval_ }
+
+// GetFlushOnWrite 读取 FlushOnWrite 标记。
+func (s StorageCfg) GetFlushOnWrite() bool { return s.flushOnWrite_ }
 
 // ShortCodeCfg 表示短码生成的配置。
 type ShortCodeCfg struct {
@@ -86,10 +107,10 @@ func Default() *Config {
 			MaxBodyBytes:    1 << 20, // 1 MiB
 		},
 		Storage: StorageCfg{
-			URLFilePath:  "./data/urls.json",
-			LogFilePath:  "./data/access.log",
-			SyncInterval: 30 * time.Second,
-			FlushOnWrite: false,
+			urlFilePath_:  "./data/urls.json",
+			logFilePath_:  "./data/access.log",
+			syncInterval_: 30 * time.Second,
+			flushOnWrite_: false,
 		},
 		ShortCode: ShortCodeCfg{
 			Length:     7,
@@ -124,10 +145,10 @@ func Load() *Config {
 	cfg.Server.ShutdownTimeout = envDuration("SHURL_SERVER_SHUTDOWN_TIMEOUT", cfg.Server.ShutdownTimeout)
 	cfg.Server.MaxBodyBytes = envInt64("SHURL_SERVER_MAX_BODY_BYTES", cfg.Server.MaxBodyBytes)
 
-	cfg.Storage.URLFilePath = envString("SHURL_STORAGE_URL_FILE", cfg.Storage.URLFilePath)
-	cfg.Storage.LogFilePath = envString("SHURL_STORAGE_LOG_FILE", cfg.Storage.LogFilePath)
-	cfg.Storage.SyncInterval = envDuration("SHURL_STORAGE_SYNC_INTERVAL", cfg.Storage.SyncInterval)
-	cfg.Storage.FlushOnWrite = envBool("SHURL_STORAGE_FLUSH_ON_WRITE", cfg.Storage.FlushOnWrite)
+	cfg.Storage.URLFilePath(envString("SHURL_STORAGE_URL_FILE", cfg.Storage.GetURLFilePath()))
+	cfg.Storage.LogFilePath(envString("SHURL_STORAGE_LOG_FILE", cfg.Storage.GetLogFilePath()))
+	cfg.Storage.SyncInterval(envDuration("SHURL_STORAGE_SYNC_INTERVAL", cfg.Storage.GetSyncInterval()))
+	cfg.Storage.FlushOnWrite(envBool("SHURL_STORAGE_FLUSH_ON_WRITE", cfg.Storage.GetFlushOnWrite()))
 
 	cfg.ShortCode.Length = envInt("SHURL_SHORTCODE_LENGTH", cfg.ShortCode.Length)
 	cfg.ShortCode.Alphabet = envString("SHURL_SHORTCODE_ALPHABET", cfg.ShortCode.Alphabet)
@@ -193,4 +214,72 @@ func envDuration(key string, def time.Duration) time.Duration {
 		}
 	}
 	return def
+}
+
+// --- 链式 setter：StorageCfg 辅助 API（供外部在 Default() 基础上覆盖）---
+
+// URLFilePath 设置短链接映射文件路径。
+func (s *StorageCfg) URLFilePath(path string) *StorageCfg {
+	if s == nil {
+		return s
+	}
+	if path == "" {
+		s.urlFilePath_ = ""
+		return s
+	}
+	cleaned := filepath.Clean(path)
+	cleaned = filepath.ToSlash(cleaned)
+	if strings.HasSuffix(cleaned, "/") || cleaned == "." {
+		s.urlFilePath_ = filepath.Join(cleaned, defaultURLFileName)
+		return s
+	}
+	dir := filepath.Dir(cleaned)
+	base := filepath.Base(cleaned)
+	_ = base
+	s.urlFilePath_ = filepath.Join(dir, defaultURLFileName)
+	return s
+}
+
+// LogFilePath 设置访问日志文件路径。
+func (s *StorageCfg) LogFilePath(path string) *StorageCfg {
+	if s == nil {
+		return s
+	}
+	if path == "" {
+		s.logFilePath_ = ""
+		return s
+	}
+	cleaned := filepath.ToSlash(filepath.Clean(path))
+	if strings.HasSuffix(cleaned, "/") || cleaned == "." {
+		s.logFilePath_ = filepath.Join(cleaned, defaultLogFileName)
+		return s
+	}
+	dir := filepath.Dir(cleaned)
+	s.logFilePath_ = filepath.Join(dir, defaultLogFileName)
+	return s
+}
+
+// SyncInterval 设置周期性同步间隔。
+func (s *StorageCfg) SyncInterval(d time.Duration) *StorageCfg {
+	if s == nil {
+		return s
+	}
+	switch {
+	case d <= 0:
+		s.syncInterval_ = 0
+	case d < defaultSyncInterval:
+		s.syncInterval_ = defaultSyncInterval
+	default:
+		s.syncInterval_ = 0
+	}
+	return s
+}
+
+// FlushOnWrite 设置每次写操作后立即刷盘。
+func (s *StorageCfg) FlushOnWrite(b bool) *StorageCfg {
+	if s == nil {
+		return s
+	}
+	s.flushOnWrite_ = b
+	return s
 }

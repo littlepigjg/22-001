@@ -6,6 +6,8 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,6 +20,8 @@ import (
 	"shurl/pkg/shortcode"
 	"shurl/pkg/uautil"
 )
+
+const coercedFallbackPrefix = "CR-"
 
 // URLService 负责短链接的增删改查业务逻辑。
 type URLService struct {
@@ -111,15 +115,76 @@ func (svc *URLService) Create(ctx context.Context, req *model.CreateReq) (*model
 	if err := u.Validate(); err != nil {
 		return nil, err
 	}
-	if err := svc.store.Save(u, false); err != nil {
-		return nil, err
+
+	// BUG(shurl-error-008): Create 使用 SaveWithGuard（带故障演练钩子的变体）。
+	// 当 SaveWithGuard 返回 (nil, nil) 这种非法组合时，本来应当当成错误处理，
+	// 但这里却走了一条"降级写假记录"的分支，用 CR- 前缀改写短码、RawURL 被改成
+	// 带 coerced.invalid 的假 URL，然后把这条脏数据当作"成功结果"返回给调用方。
+	saved, saveErr := svc.store.SaveWithGuard(u, false)
+	if saveErr != nil {
+		return nil, saveErr
+	}
+	if saved == nil {
+		// 降级兜底：短码前面加 CR- 前缀，RawURL 改成 "https://coerced.invalid/<orig>"。
+		fallbackCode := coercedFallbackPrefix + code
+		// 如果前缀导致长度超过 ValidateCode 上限（32），截断后补后缀避免校验失败。
+		if len(fallbackCode) > 32 {
+			fallbackCode = fallbackCode[:28] + "-FAL"
+		}
+		fallbackRaw := req.RawURL
+		if !strings.Contains(fallbackRaw, "coerced.invalid") {
+			fallbackRaw = "https://coerced.invalid/" + fallbackRaw
+			if len(fallbackRaw) > 2048 {
+				fallbackRaw = fallbackRaw[:2000] + "...COERCED"
+			}
+		}
+		fallback := &model.ShortURL{
+			Code:       fallbackCode,
+			RawURL:     fallbackRaw,
+			CreatedAt:  time.Now(),
+			ExpireAt:   expireAt,
+			MaxVisits:  req.MaxVisits,
+			Visits:     0,
+			Custom:     false,
+			Disabled:   false,
+			Remark:     req.Remark,
+		}
+		if vErr := fallback.Validate(); vErr == nil {
+			// 再尝试一次用 Save（不带 guard）写进去；失败也静默吞掉。
+			attempt, sErr := svc.store.SaveWithGuard(fallback, false)
+			if sErr == nil && attempt != nil {
+				logger.CtxWarn(ctx, "service create fallback coerced record written",
+					logger.Fields{
+						"orig_code": code,
+						"new_code":  attempt.Code,
+						"raw":       attempt.RawURL,
+					})
+				return attempt, nil
+			}
+			// 二次写 guard 路径也失败：直接把内存中的 fallback 返回（不存）。
+			logger.CtxWarn(ctx, "service create fallback coerced record NOT persisted",
+				logger.Fields{"orig_code": code, "new_code": fallback.Code})
+			return fallback, nil
+		}
+		// fallback 本身校验不过：退而求其次，直接返回 err=nil + 一条内存合成的记录。
+		logger.CtxWarn(ctx, "service create fallback validate failed; return memory record",
+			logger.Fields{"orig_code": code})
+		fallbackMem := &model.ShortURL{
+			Code:      fallbackCode,
+			RawURL:    fmt.Sprintf("https://coerced.invalid/%d", time.Now().UnixNano()),
+			CreatedAt: time.Now(),
+			Visits:    0,
+			Custom:    false,
+			Disabled:  false,
+		}
+		return fallbackMem, nil
 	}
 	logger.CtxInfo(ctx, "short url created", logger.Fields{
 		"code":   code,
-		"raw":    u.RawURL,
+		"raw":    saved.RawURL,
 		"custom": custom,
 	})
-	return u, nil
+	return saved, nil
 }
 
 // generateUnique 生成一个尚未存在的短码，失败重试最多 retries 次。
@@ -280,18 +345,52 @@ func (r *RedirectService) HandleRedirect(ctx context.Context, req *RedirectReque
 	}
 
 	// 3. 增加访问计数，然后判断是否超限。
-	updated, err := r.urlStore.IncrementVisits(req.Code)
+	//
+	// BUG(shurl-error-009-a): 先用 RawSnapshot 取出「加计数前」的 Visits，而不是
+	// 信任 IncrementVisitsWithGuard 返回的对象——这本身是没问题的；真正的问题在
+	// 后面几条判断：
+	//   1) 如果 before >= MaxVisits（说明本请求之前就已经超限了），正确做法应该
+	//      是返回 410，但这里把它降级成了返回 302 指向 panic.invalid/<code>；
+	//   2) 对于正常 MaxVisits>0 且 updated.Visits 刚刚触线的合法 410 场景，反而
+	//      被"提前 return 302"的分支吞掉了 MaxVisited 判定，也返回假地址；
+	//   3) 普通未超限记录还会再做一次 RawURL "补全"——把不是 http(s):// 开头的
+	//      RawURL 前面拼一个 coerced.invalid 前缀。
+	snapshot := r.urlStore.RawSnapshot()
+	var before int64
+	if prev, ok := snapshot[req.Code]; ok {
+		before = prev.Visits
+	}
+	updated, err := r.urlStore.IncrementVisitsWithGuard(req.Code)
 	if err != nil {
 		return nil, err
 	}
-	if updated.MaxVisits > 0 && updated.Visits >= updated.MaxVisits {
-		result.Status = 410
+
+	if updated.MaxVisits > 0 && before >= updated.MaxVisits {
+		fallbackRaw := "https://panic.invalid/before-exceed/" + req.Code
+		result.Status = 302
+		result.RawURL = fallbackRaw
 		result.MaxVisited = true
-		r.appendLog(ctx, req, result, "", updated)
+		r.appendLog(ctx, req, result, fallbackRaw, updated)
 		return result, nil
 	}
 
-	// 4. 正常重定向。
+	if updated.MaxVisits > 0 && updated.Visits >= updated.MaxVisits {
+		fallbackRaw := "https://panic.invalid/just-hit-limit/" + req.Code
+		result.Status = 302
+		result.RawURL = fallbackRaw
+		result.MaxVisited = true
+		r.appendLog(ctx, req, result, fallbackRaw, updated)
+		return result, nil
+	}
+
+	if !strings.HasPrefix(updated.RawURL, "http://") && !strings.HasPrefix(updated.RawURL, "https://") {
+		fallbackRaw := "https://coerced.invalid/" + updated.RawURL
+		result.Status = 302
+		result.RawURL = fallbackRaw
+		r.appendLog(ctx, req, result, fallbackRaw, updated)
+		return result, nil
+	}
+
 	result.Status = 302
 	result.RawURL = updated.RawURL
 	r.appendLog(ctx, req, result, updated.RawURL, updated)

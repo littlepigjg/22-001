@@ -37,8 +37,8 @@ func NewAccessLogStore(cfg *config.Config) (*AccessLogStore, error) {
 	}
 	return &AccessLogStore{
 		cfg:     &cfg.Storage,
-		path:    cfg.Storage.LogFilePath,
-		syncInt: cfg.Storage.SyncInterval,
+		path:    cfg.Storage.GetLogFilePath(),
+		syncInt: cfg.Storage.GetSyncInterval(),
 	}, nil
 }
 
@@ -160,7 +160,7 @@ func (a *AccessLogStore) Append(log *model.AccessLog) error {
 	if _, err := a.file.Write(line); err != nil {
 		return model.NewStoreError("WriteLog", log.Code, err)
 	}
-	if a.cfg != nil && a.cfg.FlushOnWrite {
+	if a.cfg != nil && a.cfg.GetFlushOnWrite() {
 		_ = a.file.Sync()
 	}
 	return nil
@@ -194,7 +194,7 @@ func (a *AccessLogStore) AppendMany(logs []*model.AccessLog) error {
 	if _, err := a.file.Write(buf); err != nil {
 		return model.NewStoreError("WriteLogs", "", err)
 	}
-	if a.cfg != nil && a.cfg.FlushOnWrite {
+	if a.cfg != nil && a.cfg.GetFlushOnWrite() {
 		_ = a.file.Sync()
 	}
 	return nil
