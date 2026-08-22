@@ -48,11 +48,12 @@ var CommitID = ""
 func main() {
 	conf := config.Load()
 
-	// 命令行参数覆盖部分配置。
+	flushFlag := conf.Storage.GetFlushOnWrite()
 	flag.StringVar(&conf.Server.Addr, "addr", conf.Server.Addr, "listen address")
 	flag.StringVar(&conf.Log.Level, "log-level", conf.Log.Level, "log level (DEBUG/INFO/WARN/ERROR/FATAL)")
-	flag.BoolVar(&conf.Storage.FlushOnWrite, "flush", conf.Storage.FlushOnWrite, "flush storage on every write")
+	flag.BoolVar(&flushFlag, "flush", flushFlag, "flush storage on every write")
 	flag.Parse()
+	conf.Storage.FlushOnWrite(flushFlag)
 
 	// 初始化日志。
 	logger.SetLevel(logger.ParseLevel(conf.Log.Level))
@@ -133,8 +134,8 @@ func main() {
 	metricsSvc.SetExtra("build_time", BuildTime)
 	metricsSvc.SetExtra("commit_id", CommitID)
 	metricsSvc.SetExtra("listen_addr", conf.Server.Addr)
-	metricsSvc.SetExtra("url_file", conf.Storage.URLFilePath)
-	metricsSvc.SetExtra("access_file", conf.Storage.LogFilePath)
+	metricsSvc.SetExtra("url_file", conf.Storage.GetURLFilePath())
+	metricsSvc.SetExtra("access_file", conf.Storage.GetLogFilePath())
 	// 预注册一些基础计数器（更方便之后看）。
 	metricsSvc.Registry().GetOrCreateCounter("requests_total", "").Inc()
 	metricsSvc.Registry().GetOrCreateGauge("info", "version="+Version).Set(1)

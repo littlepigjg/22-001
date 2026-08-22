@@ -6,6 +6,11 @@ FROM golang:1.22
 
 WORKDIR /app
 
+# 全局禁用 CGO：项目为纯标准库实现，禁用 CGO 后可确保跨架构（amd64/arm64）
+# 构建和容器内 go build / go test / go run 均不依赖平台特定的 cgo 工具链
+# （arm64 模拟环境下 cgo 经常出现 exit status 2 等工具链问题）。
+ENV CGO_ENABLED=0
+
 # 复制整个项目源码到 /app
 COPY . .
 
