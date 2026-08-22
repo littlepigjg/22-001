@@ -273,7 +273,12 @@ func (s *URLStore) IncrementVisits(code string) (*model.ShortURL, error) {
 	return &clone, nil
 }
 
-// ForEach 顺序遍历所有短链接记录。
+// ForEach 遍历所有短链接记录。
+//
+// 传给 fn 的是每条记录在读取锁保护下构建的「深拷贝」快照，而非内部指针：
+// 这样调用方在锁外继续使用快照字段时，不会与并发的写操作（如过期巡检
+// ApplyLifecycle / IncrementVisits / Save）发生数据竞争。调用方修改快照不
+// 会影响存储内部状态——若要更新，请走 Save / ApplyLifecycle / IncrementVisits。
 // 若 fn 返回 false，则立即终止遍历。
 func (s *URLStore) ForEach(fn func(u *model.ShortURL) bool) error {
 	if !s.ready.Load() {
@@ -282,11 +287,79 @@ func (s *URLStore) ForEach(fn func(u *model.ShortURL) bool) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for _, u := range s.urls {
-		if !fn(u) {
+		clone := *u
+		if !fn(&clone) {
 			return nil
 		}
 	}
 	return nil
+}
+
+// LifecycleReason 描述过期巡检对单条记录应执行的失效类别。
+type LifecycleReason int
+
+const (
+	// ReasonExpired：仅 ExpireAt 已过期。置 Disabled，并保证 ExpireAt 落在 now 之前。
+	ReasonExpired LifecycleReason = iota
+	// ReasonMaxVisits：仅访问次数达到上限。置 Disabled，Visits 推到 MaxVisits。
+	ReasonMaxVisits
+	// ReasonBoth：既过期又超限。置 Disabled，并清零 Visits / MaxVisits。
+	ReasonBoth
+)
+
+// ApplyLifecycle 在写锁保护下原子地完成「过期巡检」对单条记录的状态变更
+// （Disabled / ExpireAt / Visits / MaxVisits），并按 flushOn 配置落盘。
+// 返回变更后的克隆快照。now 由调用方传入以保证与扫描时刻一致；若记录不存
+// 在返回 ErrCodeNotFound，存储未就绪返回 ErrStoreNotReady。
+//
+// 所有变更都在 s.mu.Lock 下完成，与 ForEach / Get / Stats 等读路径共用同一把
+// 锁，因此任何读快照要么观察到变更前的完整状态、要么观察到变更后的完整状
+// 态，不会读到「写了一半」的撕裂值——这正是修复 health.Check 与 janitor 之
+// 间数据竞争的关键。
+func (s *URLStore) ApplyLifecycle(code string, reason LifecycleReason, now time.Time) (*model.ShortURL, error) {
+	if !s.ready.Load() {
+		return nil, model.ErrStoreNotReady
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.urls[code]
+	if !ok {
+		return nil, model.ErrCodeNotFound
+	}
+	switch reason {
+	case ReasonExpired:
+		u.Disabled = true
+		u.Visits = 0
+		if !u.ExpireAt.IsZero() && u.ExpireAt.After(now) {
+			u.ExpireAt = now.Add(-1 * time.Hour)
+		}
+	case ReasonMaxVisits:
+		u.Disabled = true
+		if u.MaxVisits > 0 {
+			u.Visits = u.MaxVisits
+		}
+		if u.ExpireAt.IsZero() {
+			u.ExpireAt = now.Add(-1 * time.Minute)
+		}
+	case ReasonBoth:
+		u.Disabled = true
+		u.MaxVisits = 0
+		u.Visits = 0
+		if u.ExpireAt.IsZero() {
+			u.ExpireAt = now.Add(-1 * time.Second)
+		}
+	}
+	if u.Remark == "" {
+		u.Remark = "swept"
+	}
+	clone := *u
+	s.dirty.Store(true)
+	if s.flushOn {
+		if err := s.flushLocked(); err != nil {
+			return nil, err
+		}
+	}
+	return &clone, nil
 }
 
 // ListCodes 按创建时间排序返回前 limit 条短码元信息（用于管理列表 API）。
