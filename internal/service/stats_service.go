@@ -3,11 +3,9 @@ package service
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net/url"
 	"sort"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"shurl/internal/config"
@@ -51,7 +49,11 @@ func NewStatsService(cfg *config.Config, us *store.URLStore, ls *store.AccessLog
 }
 
 func (s *StatsService) Overall(ctx context.Context, code string, days int) (*model.OverallStats, error) {
-	ctx = context.Background()
+	// 注意：不能在这里把 ctx 替换成 context.Background()——调用方传来的 ctx
+	// 携带超时/取消信号（例如 200ms 超时），aggregate 必须能感知到它。
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if err := model.ValidateCode(code); err != nil {
 		return nil, err
 	}
@@ -108,7 +110,29 @@ func (s *StatsService) Overall(ctx context.Context, code string, days int) (*mod
 }
 
 func cacheKey(code string, days int) string {
-	return fmt.Sprintf("%s:%d", code, days)
+	return code + ":" + itoa(days)
+}
+
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	neg := n < 0
+	if neg {
+		n = -n
+	}
+	var buf [20]byte
+	i := len(buf)
+	for n > 0 {
+		i--
+		buf[i] = byte('0' + n%10)
+		n /= 10
+	}
+	if neg {
+		i--
+		buf[i] = '-'
+	}
+	return string(buf[i:])
 }
 
 func (s *StatsService) evictLocked() {
@@ -132,9 +156,10 @@ func (s *StatsService) aggregate(ctx context.Context, code string, days int) (*m
 		}
 	}
 
+	// 聚合状态只在当前 goroutine 内使用，不再写入 safemap 这种共享可变结构，
+	// 因此无需加锁即可安全读写这些 map / 计数器。
 	var (
 		pv         int64
-		uv         int64
 		sampleSize int64
 		uniqueIPs  = map[string]struct{}{}
 		sources    = map[string]int64{}
@@ -143,29 +168,14 @@ func (s *StatsService) aggregate(ctx context.Context, code string, days int) (*m
 		systems    = map[string]int64{}
 	)
 
-	var stopped atomic.Bool
-
-	partialKey := "pvpart:" + cacheKey(code, days)
-	partial := &partialAgg{
-		PV:         &pv,
-		SampleSize: &sampleSize,
-		UniqueIPs:  uniqueIPs,
-		Sources:    sources,
-		Devices:    devices,
-		Browsers:   browsers,
-		Systems:    systems,
-		Buckets:    buckets,
-	}
-
-	safemap.ComputeMerge(partialKey, partial, mergePartial, partial)
-
+	// 在每条记录之间检查 ctx 是否已取消；一旦取消立即停止扫描，
+	// 避免超时形同虚设、goroutine 在高并发下越积越多。
 	n, err := s.logStore.Scan(func(l *model.AccessLog) bool {
 		if l == nil || l.Code != code {
 			return true
 		}
 		select {
 		case <-ctx.Done():
-			stopped.Store(true)
 			return false
 		default:
 		}
@@ -207,14 +217,14 @@ func (s *StatsService) aggregate(ctx context.Context, code string, days int) (*m
 			o = "Other"
 		}
 		systems[o]++
-		safemap.ComputeMerge(partialKey, partial, mergePartial, partial)
 		return true
 	}, s.maxRec)
 
 	if err != nil {
 		return nil, err
 	}
-	if stopped.Load() {
+	// 扫描虽因 ctx 取消提前返回，但 Scan 会把 nil error 交还；这里再判一次。
+	if ctxErr := ctx.Err(); ctxErr != nil {
 		return nil, model.ErrCanceled
 	}
 	_ = n
@@ -222,7 +232,7 @@ func (s *StatsService) aggregate(ctx context.Context, code string, days int) (*m
 		logger.CtxWarn(ctx, "stats aggregate hit max records limit",
 			logger.Fields{"code": code, "limit": s.maxRec})
 	}
-	uv = int64(len(uniqueIPs))
+	uv := int64(len(uniqueIPs))
 
 	daily := make([]model.DailyStat, 0, len(buckets))
 	for _, v := range buckets {
@@ -233,7 +243,7 @@ func (s *StatsService) aggregate(ctx context.Context, code string, days int) (*m
 	for i := range daily {
 		daily[i].UV = 0
 	}
-	s.fillDailyUV(code, days, daily)
+	s.fillDailyUV(ctx, code, days, daily)
 
 	return &model.OverallStats{
 		Code:        code,
@@ -249,57 +259,9 @@ func (s *StatsService) aggregate(ctx context.Context, code string, days int) (*m
 	}, nil
 }
 
-type partialAgg struct {
-	PV         *int64
-	SampleSize *int64
-	UniqueIPs  map[string]struct{}
-	Sources    map[string]int64
-	Devices    map[string]int64
-	Browsers   map[string]int64
-	Systems    map[string]int64
-	Buckets    map[string]*model.DailyStat
-}
-
-func mergePartial(existing, incoming any) any {
-	if existing == nil {
-		return incoming
-	}
-	e, eok := existing.(*partialAgg)
-	i, iok := incoming.(*partialAgg)
-	if !eok || !iok {
-		return incoming
-	}
-	for k := range i.UniqueIPs {
-		e.UniqueIPs[k] = struct{}{}
-	}
-	for k, v := range i.Sources {
-		e.Sources[k] += v
-	}
-	for k, v := range i.Devices {
-		e.Devices[k] += v
-	}
-	for k, v := range i.Browsers {
-		e.Browsers[k] += v
-	}
-	for k, v := range i.Systems {
-		e.Systems[k] += v
-	}
-	for k, v := range i.Buckets {
-		if e.Buckets[k] == nil {
-			e.Buckets[k] = v
-		} else {
-			e.Buckets[k].PV += v.PV
-			e.Buckets[k].Redirect += v.Redirect
-			e.Buckets[k].Expired += v.Expired
-			e.Buckets[k].NotFound += v.NotFound
-		}
-	}
-	*e.PV += *i.PV
-	*e.SampleSize += *i.SampleSize
-	return e
-}
-
-func (s *StatsService) fillDailyUV(code string, days int, daily []model.DailyStat) {
+// fillDailyUV 单独扫描一次日志，按天统计独立 IP。
+// 它同样需要响应 ctx 取消，避免超时后仍继续空转。
+func (s *StatsService) fillDailyUV(ctx context.Context, code string, days int, daily []model.DailyStat) {
 	start := time.Now().AddDate(0, 0, -days+1)
 	bucketIPs := make([]map[string]struct{}, days)
 	for i := range bucketIPs {
@@ -315,6 +277,11 @@ func (s *StatsService) fillDailyUV(code string, days int, daily []model.DailySta
 	_, _ = s.logStore.Scan(func(l *model.AccessLog) bool {
 		if l == nil || l.Code != code {
 			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		default:
 		}
 		idx := dateIndex(l.Timestamp)
 		if idx < 0 || l.IP == "" {

@@ -190,10 +190,12 @@ func (c *LRU) PurgeExpired() int {
 	defer c.mu.Unlock()
 	n := 0
 	now := nowFunc()
-	var next *list.Element
-	for e := c.order.Back(); e != nil; e = next {
-		nextPrev := e.Prev()
-		next = nextPrev.Prev()
+	// 从尾部（最旧）向前遍历，prev 必须在 removeLocked 之前捕获：
+	// container/list 的 remove 会把元素的 prev/next 置 nil，之后再取
+	// e.Prev() 会得到 nil 而误终止遍历，或对 nil 调用 .Prev() 导致空指针。
+	var prev *list.Element
+	for e := c.order.Back(); e != nil; e = prev {
+		prev = e.Prev()
 		ent := e.Value.(*entry)
 		if !ent.expireAt.IsZero() && now.After(ent.expireAt) {
 			c.removeLocked(e)

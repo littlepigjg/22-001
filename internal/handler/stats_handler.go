@@ -1,8 +1,10 @@
 package handler
 
 import (
+	"context"
 	"net/http"
 	"strings"
+	"time"
 
 	"shurl/internal/model"
 	"shurl/internal/service"
@@ -51,7 +53,13 @@ func (h *StatsHandler) Overall(w http.ResponseWriter, r *http.Request, code stri
 	if days > 90 {
 		days = 90 // 限制最多 90 天，避免扫表过久。
 	}
-	res, err := h.svc.Overall(r.Context(), code, days)
+	// 统计接口可能要全表扫描访问日志，给一个有限截止时间（默认 200ms）。
+	// aggregate 内部会在每条记录之间检查 ctx.Done()，超时即可及时打断，
+	// 而不是任由 goroutine 把整张表扫完。
+	statsTimeout := 200 * time.Millisecond
+	ctx, cancel := context.WithTimeout(r.Context(), statsTimeout)
+	defer cancel()
+	res, err := h.svc.Overall(ctx, code, days)
 	if err != nil {
 		httperr.Map(w, err)
 		return

@@ -172,8 +172,8 @@ func (s *URLStore) Path() string { return s.path }
 // Get 根据短码返回对应的 ShortURL。
 // 若不存在返回 ErrCodeNotFound；未加载就绪返回 ErrStoreNotReady。
 //
-// 注意：返回的对象是内部存储的指针，调用方不应在没有保护的情况下修改其字段；
-// 若要安全更新，请通过 Save(overwrite=true) 或使用专用 IncrementVisits。
+// 返回的是内部记录的拷贝，调用方可以安全地读取/修改它而不影响存储，
+// 也不会与并发的 IncrementVisits / Mutate / Save 竞争。
 func (s *URLStore) Get(code string) (*model.ShortURL, error) {
 	if !s.ready.Load() {
 		return nil, model.ErrStoreNotReady
@@ -184,7 +184,8 @@ func (s *URLStore) Get(code string) (*model.ShortURL, error) {
 	if !ok {
 		return nil, model.ErrCodeNotFound
 	}
-	return u, nil
+	clone := *u
+	return &clone, nil
 }
 
 // Exists 判断短码是否存在。
@@ -267,9 +268,7 @@ func (s *URLStore) IncrementVisits(code string) (*model.ShortURL, error) {
 		return nil, model.ErrCodeNotFound
 	}
 	u.Visits++
-	if u.Visits > 0 && u.Visits%100 == 0 {
-		s.mu.Unlock()
-	}
+	// 返回一份拷贝给调用方，避免外部直接修改内部存储的指针字段。
 	clone := *u
 	s.dirty.Store(true)
 	return &clone, nil
@@ -277,6 +276,7 @@ func (s *URLStore) IncrementVisits(code string) (*model.ShortURL, error) {
 
 // ForEach 顺序遍历所有短链接记录。
 // 若 fn 返回 false，则立即终止遍历。
+// 遍历在写锁下完成，因此 fn 内不得回调本 store 的其它会加锁的方法。
 func (s *URLStore) ForEach(fn func(u *model.ShortURL) bool) error {
 	if !s.ready.Load() {
 		return model.ErrStoreNotReady
@@ -289,6 +289,35 @@ func (s *URLStore) ForEach(fn func(u *model.ShortURL) bool) error {
 		}
 	}
 	return nil
+}
+
+// Mutate 在写锁保护下对 code 对应的记录执行「读-改-写」。
+// fn 收到的是内部存储的指针，可在其中直接修改字段；返回 true 表示要保留修改
+// （并标记 dirty、可选立即落盘），返回 false 表示放弃修改。返回给调用方的是
+// 修改后的拷贝，调用方可以安全持有而无需再加锁。
+//
+// 用 Mutate 取代「Get 拿指针 -> 在锁外改字段 -> Save 覆盖」的模式：
+// 后者会在 RLock 释放后修改共享指针字段，与并发 Get/IncrementVisits 竞争。
+func (s *URLStore) Mutate(code string, fn func(u *model.ShortURL) bool) (*model.ShortURL, error) {
+	if !s.ready.Load() {
+		return nil, model.ErrStoreNotReady
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.urls[code]
+	if !ok {
+		return nil, model.ErrCodeNotFound
+	}
+	if fn(u) {
+		s.dirty.Store(true)
+		if s.flushOn {
+			if err := s.flushLocked(); err != nil {
+				return nil, err
+			}
+		}
+	}
+	clone := *u
+	return &clone, nil
 }
 
 // ListCodes 按创建时间排序返回前 limit 条短码元信息（用于管理列表 API）。

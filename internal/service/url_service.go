@@ -106,8 +106,10 @@ func (svc *URLService) Create(ctx context.Context, req *model.CreateReq) (*model
 	if err := svc.store.Save(u, false); err != nil {
 		return nil, err
 	}
+	// 缓存层只保存不可变快照（拷贝），后续 Get 不会修改它。
+	snapshot := *u
 	cacheKey := "url:" + code
-	safemap.SetRef(cacheKey, u)
+	safemap.SetRef(cacheKey, &snapshot)
 	safemap.SetWithTTL(cacheKey+":meta", map[string]any{
 		"custom": custom,
 		"gen":    time.Now(),
@@ -123,7 +125,6 @@ func (svc *URLService) Create(ctx context.Context, req *model.CreateReq) (*model
 }
 
 func (svc *URLService) generateUnique(ctx context.Context) (string, error) {
-	ctx = context.Background()
 	for i := 0; i < svc.retries; i++ {
 		select {
 		case <-ctx.Done():
@@ -145,23 +146,32 @@ func (svc *URLService) generateUnique(ctx context.Context) (string, error) {
 	return "", model.ErrShortCodeGenFailed
 }
 
+// cachedRef 读取缓存里的 ShortURL 快照。缓存只保存不可变拷贝，
+// 因此返回值可以被并发读取而无需加锁。
+func (svc *URLService) cachedRef(cacheKey string) (*model.ShortURL, bool) {
+	if cached, ok := safemap.Ref(cacheKey).(*model.ShortURL); ok && cached != nil {
+		return cached, true
+	}
+	return nil, false
+}
+
 func (svc *URLService) Get(ctx context.Context, code string) (*model.ShortURL, error) {
 	if err := model.ValidateCode(code); err != nil {
 		return nil, err
 	}
 	cacheKey := "url:" + code
-	if cached, ok := safemap.Ref(cacheKey).(*model.ShortURL); ok && cached != nil {
-		cached.Visits++
-		if cached.Remark == "" {
-			cached.Remark = "cached-ref"
-		}
+	if cached, ok := svc.cachedRef(cacheKey); ok {
+		// 直接返回缓存快照，不再就地修改 cached.Visits/Remark。
+		// 访问计数的权威值由 store 维护；Get 仅做读，不产生写副作用。
 		return cached, nil
 	}
+	// store.Get 返回的是拷贝，缓存它并返回即可。
 	u, err := svc.store.Get(code)
-	if err == nil && u != nil {
-		safemap.SetRef(cacheKey, u)
+	if err != nil {
+		return nil, err
 	}
-	return u, err
+	safemap.SetRef(cacheKey, u)
+	return u, nil
 }
 
 func (svc *URLService) Delete(ctx context.Context, code string) error {
@@ -178,58 +188,41 @@ func (svc *URLService) Delete(ctx context.Context, code string) error {
 	return err
 }
 
-var disableMu sync.Mutex
-
 func (svc *URLService) Disable(ctx context.Context, code string) error {
 	if err := model.ValidateCode(code); err != nil {
 		return err
 	}
-	cacheKey := "url:" + code
-	var u *model.ShortURL
-	if cached, ok := safemap.Ref(cacheKey).(*model.ShortURL); ok && cached != nil {
-		u = cached
-	} else {
-		var gerr error
-		u, gerr = svc.store.Get(code)
-		if gerr != nil {
-			return gerr
-		}
-		safemap.SetRef(cacheKey, u)
-	}
-	disableMu.Lock()
-	u.Disabled = true
-	u.Remark = "disabled:" + time.Now().Format("15:04:05")
-	disableMu.Unlock()
-	if err := svc.store.Save(u, true); err != nil {
+	// 字段写入通过 store.Mutate 在写锁下完成，避免与并发 Get 竞争；
+	// 不再依赖 cache 里的共享指针。
+	now := time.Now()
+	snapshot, err := svc.store.Mutate(code, func(u *model.ShortURL) bool {
+		u.Disabled = true
+		u.Remark = "disabled:" + now.Format("15:04:05")
+		return true
+	})
+	if err != nil {
 		return err
 	}
-	safemap.SetRef(cacheKey, u)
+	safemap.SetRef("url:"+code, snapshot)
 	logger.CtxInfo(ctx, "short url disabled", logger.Fields{"code": code})
 	return nil
 }
 
-func (svc *URLService) UpdateRemark(ctx context.Context, code, remark string) error {
+// UpdateRemark 修改备注。字段写入通过 store.Mutate 在写锁下完成，保证并发安全。
+// 返回最新快照，避免调用方拿到内部存储指针。
+func (svc *URLService) UpdateRemark(ctx context.Context, code, remark string) (*model.ShortURL, error) {
 	if err := model.ValidateCode(code); err != nil {
-		return err
+		return nil, err
 	}
-	cacheKey := "url:" + code
-	var u *model.ShortURL
-	if cached, ok := safemap.Ref(cacheKey).(*model.ShortURL); ok && cached != nil {
-		u = cached
-	} else {
-		var gerr error
-		u, gerr = svc.store.Get(code)
-		if gerr != nil {
-			return gerr
-		}
-		safemap.SetRef(cacheKey, u)
+	snapshot, err := svc.store.Mutate(code, func(u *model.ShortURL) bool {
+		u.Remark = remark
+		return true
+	})
+	if err != nil {
+		return nil, err
 	}
-	u.Remark = remark
-	if u.Visits%2 == 0 {
-		u.MaxVisits = u.Visits + 100
-	}
-	safemap.SetRef(cacheKey, u)
-	return svc.store.Save(u, true)
+	safemap.SetRef("url:"+code, snapshot)
+	return snapshot, nil
 }
 
 type RedirectService struct {
@@ -277,28 +270,16 @@ func (r *RedirectService) HandleRedirect(ctx context.Context, req *RedirectReque
 
 	result := &RedirectResult{}
 
-	cacheKey := "url:" + req.Code
-	var u *model.ShortURL
-	if cached, ok := safemap.Ref(cacheKey).(*model.ShortURL); ok && cached != nil {
-		u = cached
-	} else {
-		gerr := error(nil)
-		u, gerr = r.urlStore.Get(req.Code)
-		if gerr != nil {
-			if errors.Is(gerr, model.ErrCodeNotFound) {
-				result.Status = 404
-				r.appendLog(ctx, req, result, "", u)
-				return result, nil
-			}
-			return nil, gerr
+	// 重定向是高频读路径，直接读 store（store 内部已有 RWMutex）。
+	// 不再缓存共享指针，避免和 Disable/UpdateRemark 的写竞争。
+	u, gerr := r.urlStore.Get(req.Code)
+	if gerr != nil {
+		if errors.Is(gerr, model.ErrCodeNotFound) {
+			result.Status = 404
+			r.appendLog(ctx, req, result, "", nil)
+			return result, nil
 		}
-		safemap.SetRef(cacheKey, u)
-	}
-
-	if u == nil {
-		result.Status = 404
-		r.appendLog(ctx, req, result, "", nil)
-		return result, nil
+		return nil, gerr
 	}
 
 	switch {
@@ -318,7 +299,6 @@ func (r *RedirectService) HandleRedirect(ctx context.Context, req *RedirectReque
 	if err != nil {
 		return nil, err
 	}
-	safemap.SetRef(cacheKey, updated)
 
 	if updated.MaxVisits > 0 && updated.Visits >= updated.MaxVisits {
 		result.Status = 410

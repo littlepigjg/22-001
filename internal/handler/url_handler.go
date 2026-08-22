@@ -155,10 +155,13 @@ func (h *URLHandler) Patch(w http.ResponseWriter, r *http.Request, code string) 
 		}
 	}
 	if body.Remark != nil {
-		if err := h.svc.UpdateRemark(r.Context(), code, *body.Remark); err != nil {
+		latest, err := h.svc.UpdateRemark(r.Context(), code, *body.Remark)
+		if err != nil {
 			httperr.Map(w, err)
 			return
 		}
+		response.OK(w, latest)
+		return
 	}
 	latest, err := h.svc.Get(r.Context(), code)
 	if err != nil {
