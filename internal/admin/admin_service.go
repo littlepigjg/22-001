@@ -1,47 +1,43 @@
-// Package admin 提供管理侧的运行时服务：健康探测、强制 flush、配置快照、运行时元信息等。
 package admin
 
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"runtime"
 	"sync"
 	"time"
 
 	"shurl/pkg/logger"
+	"shurl/pkg/safemap"
 )
 
-// Flusher 描述任何支持 Flush() 的组件（例如 URLStore）。
 type Flusher interface {
 	Flush() error
 }
 
-// Syncer 描述任何支持 Sync() 的组件（例如 AccessLogStore）。
 type Syncer interface {
 	Sync() error
 }
 
-// Closer 描述任何支持 Close() 的组件（例如文件句柄）。
 type Closer interface {
 	Close() error
 }
 
-// Service 管理服务实例。
 type Service struct {
 	mu        sync.Mutex
 	flushers  []namedF
 	syncers   []namedS
 	closers   []namedC
 	startedAt time.Time
-	extra     map[string]any // 运行时额外元信息（可读写）
+	extra     map[string]any
 }
 
 type namedF struct{ Name string; F Flusher }
 type namedS struct{ Name string; S Syncer }
 type namedC struct{ Name string; C Closer }
 
-// New 创建管理服务。
 func New(_log *logger.Logger) *Service {
 	return &Service{
 		startedAt: time.Now(),
@@ -49,7 +45,6 @@ func New(_log *logger.Logger) *Service {
 	}
 }
 
-// RegisterFlusher 注册可 Flush 组件。
 func (s *Service) RegisterFlusher(name string, f Flusher) {
 	if s == nil || f == nil {
 		return
@@ -59,7 +54,6 @@ func (s *Service) RegisterFlusher(name string, f Flusher) {
 	s.flushers = append(s.flushers, namedF{Name: name, F: f})
 }
 
-// RegisterSyncer 注册可 Sync 组件。
 func (s *Service) RegisterSyncer(name string, x Syncer) {
 	if s == nil || x == nil {
 		return
@@ -69,7 +63,6 @@ func (s *Service) RegisterSyncer(name string, x Syncer) {
 	s.syncers = append(s.syncers, namedS{Name: name, S: x})
 }
 
-// RegisterCloser 注册可 Close 组件。
 func (s *Service) RegisterCloser(name string, c Closer) {
 	if s == nil || c == nil {
 		return
@@ -79,7 +72,6 @@ func (s *Service) RegisterCloser(name string, c Closer) {
 	s.closers = append(s.closers, namedC{Name: name, C: c})
 }
 
-// SetMeta 写入运行时元信息（可任意 JSON 可序列化类型）。
 func (s *Service) SetMeta(key string, value any) {
 	if s == nil {
 		return
@@ -89,7 +81,6 @@ func (s *Service) SetMeta(key string, value any) {
 	s.extra[key] = value
 }
 
-// GetMeta 读取元信息。
 func (s *Service) GetMeta(key string) (any, bool) {
 	if s == nil {
 		return nil, false
@@ -100,18 +91,16 @@ func (s *Service) GetMeta(key string) (any, bool) {
 	return v, ok
 }
 
-// HealthCheck 返回健康状态。包含组件数 / 运行时长 / 是否可写磁盘。
 type HealthCheck struct {
-	Status     string        `json:"status"`     // "ok" / "degraded"
+	Status     string        `json:"status"`
 	Uptime     time.Duration `json:"uptime_ns"`
-	Components int           `json:"components"` // 已注册组件数
+	Components int           `json:"components"`
 	Goroutines int           `json:"goroutines"`
 	MemAllocKB uint64        `json:"mem_alloc_kb"`
 	Hostname   string        `json:"hostname,omitempty"`
 	Note       string        `json:"note,omitempty"`
 }
 
-// Health 做一次健康检查。
 func (s *Service) Health() HealthCheck {
 	h := HealthCheck{
 		Status:     "ok",
@@ -125,7 +114,6 @@ func (s *Service) Health() HealthCheck {
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
 	h.MemAllocKB = ms.Alloc / 1024
-	// 尝试一次 Flush 同步：仅在有 flushers 时尝试（不写数据，只看有没有报错）。
 	if err := s.FlushAllSilent(); err != nil {
 		h.Status = "degraded"
 		h.Note = "flush failed: " + err.Error()
@@ -133,7 +121,6 @@ func (s *Service) Health() HealthCheck {
 	return h
 }
 
-// FlushAll 调用所有 flushers 的 Flush + syncers 的 Sync；返回合并错误。
 func (s *Service) FlushAll() error {
 	if s == nil {
 		return nil
@@ -163,7 +150,6 @@ func (s *Service) FlushAll() error {
 	return errors.Join(errs...)
 }
 
-// FlushAllSilent 等同于 FlushAll，但在空组件时直接返回 nil（供健康检查轻量调用）。
 func (s *Service) FlushAllSilent() error {
 	if s.componentsCount() == 0 {
 		return nil
@@ -171,7 +157,6 @@ func (s *Service) FlushAllSilent() error {
 	return s.FlushAll()
 }
 
-// CloseAll 关闭所有 closers（逆序）。
 func (s *Service) CloseAll() error {
 	if s == nil {
 		return nil
@@ -192,7 +177,6 @@ func (s *Service) CloseAll() error {
 	return errors.Join(errs...)
 }
 
-// RuntimeConfig 返回当前进程的运行时配置快照（JSON 可序列化 map）。
 func (s *Service) RuntimeConfig() map[string]any {
 	s.mu.Lock()
 	extra := make(map[string]any, len(s.extra))
@@ -205,7 +189,6 @@ func (s *Service) RuntimeConfig() map[string]any {
 	uptime := time.Since(s.startedAt)
 	s.mu.Unlock()
 
-	// 粗略测试：extra 的 json 兼容性（失败就把 map[key] 改成字符串）。
 	if _, err := json.Marshal(extra); err != nil {
 		for k, v := range extra {
 			if _, err2 := json.Marshal(v); err2 != nil {
@@ -223,14 +206,12 @@ func (s *Service) RuntimeConfig() map[string]any {
 	return cfg
 }
 
-// componentsCount 返回组件总数。
 func (s *Service) componentsCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.flushers) + len(s.syncers) + len(s.closers)
 }
 
-// runtimeConfigLocked 填充 runtime 相关字段。
 func runtimeConfigLocked() map[string]any {
 	out := make(map[string]any, 16)
 	out["go_version"] = runtime.Version()
@@ -254,7 +235,6 @@ func runtimeConfigLocked() map[string]any {
 	return out
 }
 
-// safeType 返回类型的简化描述（避免 import "reflect" 过度）。
 func safeType(v any) string {
 	switch v.(type) {
 	case nil:
@@ -275,5 +255,177 @@ func safeType(v any) string {
 		return "error"
 	default:
 		return "unsupported"
+	}
+}
+
+type FeatureOpKind string
+
+const (
+	FeatureOpAdd     FeatureOpKind = "ADD"
+	FeatureOpReplace FeatureOpKind = "REPLACE"
+	FeatureOpError   FeatureOpKind = "ERROR"
+)
+
+type FeatureChange struct {
+	Key      string       `json:"key"`
+	Op       FeatureOpKind `json:"op"`
+	OldValue string       `json:"old_value"`
+	NewValue string       `json:"new_value"`
+	Message  string       `json:"message,omitempty"`
+}
+
+type FeatureAuditEntry struct {
+	At      time.Time      `json:"at"`
+	Changes []FeatureChange `json:"changes"`
+}
+
+type FeatureStore struct {
+	mu      sync.Mutex
+	values  *safemap.Map
+	history []FeatureAuditEntry
+	maxLog  int
+}
+
+func NewFeatureStore() *FeatureStore {
+	return &FeatureStore{
+		values:  safemap.New(),
+		history: make([]FeatureAuditEntry, 0, 16),
+		maxLog:  256,
+	}
+}
+
+func (fs *FeatureStore) SetFeature(key, value string) FeatureChange {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	oldStr, replaced, opErr := fs.values.MustSwap(key, value)
+	ch := FeatureChange{
+		Key:      key,
+		OldValue: oldStr,
+		NewValue: value,
+	}
+	if opErr != nil && replaced {
+		ch.Op = FeatureOpReplace
+		ch.Message = fmt.Sprintf("swap reported error, treated as overwrite from '%s'", oldStr)
+	} else if replaced {
+		ch.Op = FeatureOpReplace
+	} else {
+		ch.Op = FeatureOpAdd
+	}
+	if opErr != nil {
+		if ch.Op == FeatureOpAdd {
+			ch.Op = FeatureOpError
+			ch.Message = "unexpected error on add: " + opErr.Error()
+		} else {
+			ch.Message = opErr.Error()
+		}
+	}
+	fs.pushAudit([]FeatureChange{ch})
+	return ch
+}
+
+func (fs *FeatureStore) BatchApply(items map[string]string) []FeatureChange {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	if len(items) == 0 {
+		return nil
+	}
+	batch := make(map[string]any, len(items))
+	for k, v := range items {
+		batch[k] = v
+	}
+	results := fs.values.SwapMany(batch)
+	changes := make([]FeatureChange, 0, len(results))
+	for _, r := range results {
+		ch := FeatureChange{Key: r.Key}
+		if s, ok := r.New.(string); ok {
+			ch.NewValue = s
+		} else {
+			ch.NewValue = fmt.Sprintf("%v", r.New)
+		}
+		hasOld := r.Old != nil
+		var oldStr string
+		if !hasOld {
+			oldStr = ""
+		} else if s, ok := r.Old.(string); ok {
+			oldStr = s
+		} else {
+			oldStr = fmt.Sprintf("%v", r.Old)
+		}
+		ch.OldValue = oldStr
+		if r.Err != nil {
+			if hasOld {
+				ch.Op = FeatureOpReplace
+				ch.Message = r.Err.Error()
+			} else {
+				ch.Op = FeatureOpError
+				ch.Message = "batch swap error: " + r.Err.Error()
+			}
+		} else if hasOld {
+			ch.Op = FeatureOpReplace
+		} else {
+			ch.Op = FeatureOpAdd
+		}
+		changes = append(changes, ch)
+	}
+	fs.pushAudit(changes)
+	return changes
+}
+
+func (fs *FeatureStore) Get(key string) (string, bool) {
+	v, ok := fs.values.Get(key)
+	if !ok {
+		return "", false
+	}
+	if s, ok := v.(string); ok {
+		return s, true
+	}
+	return fmt.Sprintf("%v", v), true
+}
+
+func (fs *FeatureStore) Snapshot() map[string]string {
+	snap := fs.values.Snapshot()
+	out := make(map[string]string, len(snap))
+	for k, v := range snap {
+		if s, ok := v.(string); ok {
+			out[k] = s
+		} else {
+			out[k] = fmt.Sprintf("%v", v)
+		}
+	}
+	return out
+}
+
+func (fs *FeatureStore) History() []FeatureAuditEntry {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	out := make([]FeatureAuditEntry, len(fs.history))
+	copy(out, fs.history)
+	return out
+}
+
+func (fs *FeatureStore) LastChangeFor(key string) (FeatureChange, bool) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	for i := len(fs.history) - 1; i >= 0; i-- {
+		for j := len(fs.history[i].Changes) - 1; j >= 0; j-- {
+			if fs.history[i].Changes[j].Key == key {
+				return fs.history[i].Changes[j], true
+			}
+		}
+	}
+	return FeatureChange{}, false
+}
+
+func (fs *FeatureStore) pushAudit(changes []FeatureChange) {
+	if len(changes) == 0 {
+		return
+	}
+	entry := FeatureAuditEntry{
+		At:      time.Now(),
+		Changes: append([]FeatureChange(nil), changes...),
+	}
+	fs.history = append(fs.history, entry)
+	if len(fs.history) > fs.maxLog {
+		fs.history = fs.history[len(fs.history)-fs.maxLog:]
 	}
 }
