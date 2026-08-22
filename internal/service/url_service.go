@@ -3,8 +3,7 @@ package service
 import (
 	"context"
 	"errors"
-	"sort"
-	"sync"
+	"net/http"
 	"time"
 
 	"shurl/internal/config"
@@ -171,12 +170,8 @@ func (svc *URLService) Disable(ctx context.Context, code string) error {
 	if err := model.ValidateCode(code); err != nil {
 		return err
 	}
-	u, err := svc.store.Get(code)
-	if err != nil {
-		return err
-	}
-	u.Disabled = true
-	if err := svc.store.Save(u, true); err != nil {
+	// 原子地置位 Disabled，避免 Get→改指针→Save 往返会把陈旧 Visits 覆盖回去。
+	if err := svc.store.SetDisabled(code, true); err != nil {
 		return err
 	}
 	logger.CtxInfo(ctx, "short url disabled", logger.Fields{"code": code})
@@ -187,125 +182,20 @@ func (svc *URLService) UpdateRemark(ctx context.Context, code, remark string) er
 	if err := model.ValidateCode(code); err != nil {
 		return err
 	}
-	u, err := svc.store.Get(code)
-	if err != nil {
-		return err
-	}
-	u.Remark = remark
-	return svc.store.Save(u, true)
+	// 原子地更新 Remark，理由同 Disable。
+	return svc.store.SetRemark(code, remark)
 }
 
 type RedirectService struct {
 	urlStore *store.URLStore
 	logStore *store.AccessLogStore
-	mu       sync.Mutex
-
-	cache       map[string]*model.ShortURL
-	cacheCap    int
-	pending     []string
-	pendingCap  int
-	workers     int
-	wg          sync.WaitGroup
-	cancelFn    context.CancelFunc
-	triggerCh   chan struct{}
-	flushInt    time.Duration
 }
 
 func NewRedirectService(us *store.URLStore, ls *store.AccessLogStore) (*RedirectService, error) {
 	if us == nil || ls == nil {
 		return nil, model.ErrStoreNotReady
 	}
-	cacheCap := 2048
-	if cacheCap < 32 {
-		cacheCap = 32
-	}
-	pendingCap := 1024
-	if pendingCap < 64 {
-		pendingCap = 64
-	}
-	workers := 4
-	if workers < 1 {
-		workers = 1
-	}
-	flushInt := 50 * time.Millisecond
-	if flushInt <= 0 {
-		flushInt = 50 * time.Millisecond
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	r := &RedirectService{
-		urlStore:   us,
-		logStore:   ls,
-		cache:      make(map[string]*model.ShortURL, cacheCap),
-		cacheCap:   cacheCap,
-		pending:    make([]string, 0, pendingCap),
-		pendingCap: pendingCap,
-		workers:    workers,
-		triggerCh:  make(chan struct{}, 1),
-		flushInt:   flushInt,
-		cancelFn:   cancel,
-	}
-	r.startWorkers(ctx)
-	return r, nil
-}
-
-func (r *RedirectService) startWorkers(ctx context.Context) {
-	for i := 0; i < r.workers; i++ {
-		r.wg.Add(1)
-		go r.worker(ctx)
-	}
-	r.wg.Add(1)
-	go r.ticker(ctx)
-}
-
-func (r *RedirectService) worker(ctx context.Context) {
-	defer r.wg.Done()
-	for {
-		select {
-		case <-ctx.Done():
-			r.flushPending()
-			return
-		case <-r.triggerCh:
-			r.flushPending()
-		}
-	}
-}
-
-func (r *RedirectService) ticker(ctx context.Context) {
-	defer r.wg.Done()
-	t := time.NewTicker(r.flushInt)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			select {
-			case r.triggerCh <- struct{}{}:
-			default:
-			}
-		}
-	}
-}
-
-func (r *RedirectService) Shutdown(ctx context.Context) error {
-	if r.cancelFn != nil {
-		r.cancelFn()
-	}
-	done := make(chan struct{})
-	go func() {
-		r.wg.Wait()
-		close(done)
-	}()
-	if ctx == nil {
-		<-done
-		return nil
-	}
-	select {
-	case <-done:
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-	return nil
+	return &RedirectService{urlStore: us, logStore: ls}, nil
 }
 
 type RedirectRequest struct {
@@ -338,121 +228,52 @@ func (r *RedirectService) HandleRedirect(ctx context.Context, req *RedirectReque
 		ts = time.Now()
 	}
 
+	// 访问判定 + 自增 + max-visits 自动禁用全部在 store 写锁内完成，
+	// RedirectService 不再持有或改写任何 *ShortURL 字段。
 	result := &RedirectResult{}
-	u := r.lookupOrFetch(req.Code)
-	if u == nil {
-		result.Status = 404
-		r.appendLog(ctx, req, result, "", nil)
-		return result, nil
+	out, err := r.urlStore.RecordVisit(req.Code, ts)
+	if err != nil {
+		return nil, err
 	}
-
 	switch {
-	case u.Disabled:
-		result.Status = 410
+	case !out.Found:
+		result.Status = http.StatusNotFound
+		r.appendLog(ctx, req, result, "")
+		return result, nil
+	case out.Disabled:
+		result.Status = http.StatusGone
 		result.Disabled = true
-		r.appendLog(ctx, req, result, "", u)
+		r.appendLog(ctx, req, result, "")
 		return result, nil
-	case u.IsExpired(ts):
-		result.Status = 410
+	case out.Expired:
+		result.Status = http.StatusGone
 		result.Expired = true
-		r.appendLog(ctx, req, result, "", u)
+		r.appendLog(ctx, req, result, "")
 		return result, nil
-	}
-
-	u.Visits++
-	r.enqueuePending(req.Code)
-
-	if u.MaxVisits > 0 && u.Visits >= u.MaxVisits {
-		u.Disabled = true
-		result.Status = 410
+	case out.MaxVisited:
+		result.Status = http.StatusGone
 		result.MaxVisited = true
-		r.appendLog(ctx, req, result, "", u)
+		r.appendLog(ctx, req, result, "")
 		return result, nil
 	}
-
-	result.Status = 302
-	result.RawURL = u.RawURL
-	r.appendLog(ctx, req, result, u.RawURL, u)
+	result.Status = http.StatusFound
+	result.RawURL = out.RawURL
+	r.appendLog(ctx, req, result, out.RawURL)
 	return result, nil
 }
 
-func (r *RedirectService) lookupOrFetch(code string) *model.ShortURL {
-	r.mu.Lock()
-	if u, ok := r.cache[code]; ok {
-		r.mu.Unlock()
-		return u
-	}
-	r.mu.Unlock()
-	u := r.urlStore.GetCached(code)
-	if u == nil {
-		return nil
-	}
-	r.mu.Lock()
-	if len(r.cache) >= r.cacheCap {
-		r.evictCacheLocked()
-	}
-	if existing, ok := r.cache[code]; ok {
-		r.mu.Unlock()
-		return existing
-	}
-	r.cache[code] = u
-	r.mu.Unlock()
-	return u
+func (r *RedirectService) Shutdown(ctx context.Context) error {
+	// 异步批处理 machinery 已移除，无需停 worker / ticker；保留方法供 main 调用。
+	return nil
 }
 
-func (r *RedirectService) evictCacheLocked() {
-	keys := make([]string, 0, len(r.cache))
-	for k := range r.cache {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	evictCount := len(keys) / 4
-	if evictCount < 1 {
-		evictCount = 1
-	}
-	if evictCount > len(keys) {
-		evictCount = len(keys)
-	}
-	for i := 0; i < evictCount; i++ {
-		delete(r.cache, keys[i])
-	}
-}
-
-func (r *RedirectService) enqueuePending(code string) {
-	r.mu.Lock()
-	r.pending = append(r.pending, code)
-	needFlush := len(r.pending) >= r.pendingCap
-	r.mu.Unlock()
-	if needFlush {
-		select {
-		case r.triggerCh <- struct{}{}:
-		default:
-		}
-	}
-}
-
-func (r *RedirectService) flushPending() {
-	r.mu.Lock()
-	if len(r.pending) == 0 {
-		r.mu.Unlock()
-		return
-	}
-	local := r.pending
-	r.pending = make([]string, 0, r.pendingCap)
-	r.mu.Unlock()
-	r.urlStore.BulkIncrementVisits(local)
-}
-
-func (r *RedirectService) appendLog(ctx context.Context, req *RedirectRequest, res *RedirectResult, raw string, u *model.ShortURL) {
+func (r *RedirectService) appendLog(ctx context.Context, req *RedirectRequest, res *RedirectResult, raw string) {
 	ip := iputil.RealIP(req.RemoteAddr, req.Headers)
 	uaStr := firstHeader(req.Headers, "User-Agent")
 	referer := firstHeader(req.Headers, "Referer")
 	uaParsed := uautil.Parse(uaStr)
 
 	code := req.Code
-	if u != nil {
-		code = u.Code
-	}
 
 	log := &model.AccessLog{
 		ID:        idgen.NewString(),

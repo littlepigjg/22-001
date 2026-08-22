@@ -120,7 +120,9 @@ func (j *JanitorService) RunOnce(batch int) int {
 func (j *JanitorService) runOnce(batch int) int {
 	now := time.Now()
 	var processed, marked int
-	candidates := make([]*model.ShortURL, 0, batch)
+	// ForEach 现在返回克隆快照；这里只读字段做判定，收集候选 code，
+	// 随后用原子 SetDisabled 落地，避免 Get→改指针→Save 往返把陈旧 Visits 覆盖回去。
+	candidates := make([]string, 0, batch)
 
 	err := j.urlStore.ForEach(func(u *model.ShortURL) bool {
 		if processed >= batch {
@@ -133,7 +135,7 @@ func (j *JanitorService) runOnce(batch int) int {
 			return true
 		}
 		if u.IsExpired(now) || u.ExceedsMaxVisits() {
-			candidates = append(candidates, u)
+			candidates = append(candidates, u.Code)
 			marked++
 		}
 		processed++
@@ -144,12 +146,11 @@ func (j *JanitorService) runOnce(batch int) int {
 		return 0
 	}
 
-	// 批量更新 Disabled 字段。
+	// 批量置 Disabled。
 	updated := 0
-	for _, u := range candidates {
-		u.Disabled = true
-		if err := j.urlStore.Save(u, true); err != nil {
-			logger.Warn("janitor disable url error", logger.Fields{"err": err.Error(), "code": u.Code})
+	for _, code := range candidates {
+		if err := j.urlStore.SetDisabled(code, true); err != nil {
+			logger.Warn("janitor disable url error", logger.Fields{"err": err.Error(), "code": code})
 			continue
 		}
 		updated++
