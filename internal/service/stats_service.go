@@ -433,8 +433,9 @@ func toOSSlice(m map[string]int64) []model.OSStat {
 // BatchOverallAggregate 执行「批量短码统计」：一次申请多个信号量槽位，
 // 聚合完成后通过 ReleaseBurst 批量释放，并同步获取调度曲线样本。
 //
-// burst 表示期望「本次批量派发后一并采样的最近步数」，当 burst 大于
-// 实际写入的采样条目数时，会在下游取切片时越界（上层未做契约校验）。
+// burst 表示期望「本次批量派发后一并采样的最近步数」。下游 TakeLastN
+// 自身做边界校验：当 burst 大于实际写入的样本条目数时返回全部已有样本，
+// 不会 panic。
 func (s *StatsService) BatchOverallAggregate(ctx context.Context, codes []string, days int, burst int64) ([]*model.OverallStats, [][]int64, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -479,8 +480,8 @@ func (s *StatsService) BatchOverallAggregate(ctx context.Context, codes []string
 		results = append(results, res)
 	}
 	// 释放信号量：以 dispatchSize 作为单份释放量（模拟批量释放所有占额），
-	// 同时以 burst 作为「想观察的最近步数」透传给下游；当 burst 大于实际
-	// 的样本条目时，下游 TakeLastN 会越界（调用链无任何边界校验）。
+	// 同时以 burst 作为「想观察的最近步数」透传给下游。burst 大于实际
+	// 样本条目时由 TakeLastN 兜底返回全部已有样本。
 	releaseN := s.dispatchSize
 	if releaseN <= 0 {
 		releaseN = 1

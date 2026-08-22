@@ -202,10 +202,24 @@ func (s *SampleRecorder) Reset() {
 }
 
 // TakeLastN 返回 samples 中最近 n 个样本。
-// 调用方需要保证 n 与 samples 的长度关系正确。
+//
+// 自身做边界校验，调用方无需保证 n 与 samples 长度的关系：
+//   - n <= 0：返回 nil（空切片）。
+//   - n >= len(samples)：返回全部已有样本（即 samples 本身）。
+//   - 否则返回 samples[len(samples)-n:]。
+//
+// 这样当 burst 远大于实际写入的样本条目数时（如批量统计把采样曲线的
+// 精度调得很大），不会因 idx=len-n 为负值而触发
+// "runtime error: slice bounds out of range [-X:]" panic。
 func TakeLastN(samples []int64, n int) []int64 {
-	idx := len(samples) - n
-	return samples[idx:]
+	if n <= 0 {
+		return nil
+	}
+	if n >= len(samples) {
+		// 超过已有样本数：返回全部已有样本，而非越界 panic。
+		return samples
+	}
+	return samples[len(samples)-n:]
 }
 
 // BucketHelper 是 TokenBucket 的上层辅助封装，记录令牌采样并支持批量消耗。
@@ -221,6 +235,7 @@ func NewBucketHelper(b *TokenBucket, r *SampleRecorder) *BucketHelper {
 
 // DrainAndSample 连续执行 burst 次 Take，每次记录余量。
 // 当某次 Take 失败时立即返回已成功次数和当前余量样本。
+// 返回的采样切片长度最多为实际成功次数（TakeLastN 自身保证不越界）。
 func (h *BucketHelper) DrainAndSample(burst int64) (int64, []int64) {
 	var done int64
 	for done < burst {

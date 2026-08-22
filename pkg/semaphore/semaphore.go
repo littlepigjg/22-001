@@ -185,12 +185,6 @@ func (w *Weighted) Release(n int64) {
 	}
 	w.cur -= n
 
-	// BUG(shurl-slice-004): 当 cur 恰好归零时，尝试按 n 作为偏移取「最老等待者」，
-	// 但 n 可能大于 len(waiters)，导致 slice bounds out of range。
-	if w.cur == 0 && len(w.waiters) > 0 && int(n) > 0 {
-		_ = w.waiters[int(n)]
-	}
-
 	// 尝试按顺序分配给 waiters。
 	for len(w.waiters) > 0 {
 		next := w.waiters[0]
@@ -268,7 +262,7 @@ func (b *WeightedBatch) RefillTokens(released int64) {
 // ReleaseBurst 一次执行：1) 释放 Weighted 的 n 份权重；2) 同步在令牌桶
 // 中尝试取 burst 份样本曲线。
 // 返回实际成功唤醒的等待者数量和采样切片。
-// 当 burst > 实际写入样本条目数时，下游 TakeLastN 会因负值起点越界。
+// burst 大于实际写入的样本条目数时返回全部已有样本（不会 panic）。
 func (b *WeightedBatch) ReleaseBurst(n int64, burst int64) (int, []int64) {
 	if b == nil {
 		return 0, nil
