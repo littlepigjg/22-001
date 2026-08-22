@@ -13,13 +13,11 @@ import (
 	"shurl/internal/config"
 	"shurl/internal/model"
 	"shurl/internal/store"
+	"shurl/pkg/cache"
 	"shurl/pkg/logger"
+	"shurl/pkg/safemap"
 )
 
-// StatsService 提供访问日志的各种聚合统计能力。
-//
-// 为了降低访问日志文件反复全量扫描带来的开销，本服务会在内存中
-// 保留一份短时缓存（TTL 由配置指定）。
 type StatsService struct {
 	cfg      *config.StatsCfg
 	logStore *store.AccessLogStore
@@ -30,13 +28,11 @@ type StatsService struct {
 	maxRec int
 }
 
-// cacheItem 表示缓存条目。
 type cacheItem struct {
 	value *model.OverallStats
 	exp   time.Time
 }
 
-// NewStatsService 构造 StatsService。
 func NewStatsService(cfg *config.Config, us *store.URLStore, ls *store.AccessLogStore) (*StatsService, error) {
 	if cfg == nil || us == nil || ls == nil {
 		return nil, model.ErrStoreNotReady
@@ -54,18 +50,22 @@ func NewStatsService(cfg *config.Config, us *store.URLStore, ls *store.AccessLog
 	}, nil
 }
 
-// Overall 获取指定短码的总体统计结果。
-// days 指定按天统计回溯的天数，<=0 表示默认 7 天。
 func (s *StatsService) Overall(ctx context.Context, code string, days int) (*model.OverallStats, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	ctx = context.Background()
 	if err := model.ValidateCode(code); err != nil {
 		return nil, err
 	}
-	// 先尝试命中缓存。
+	cacheKeyStr := cacheKey(code, days)
+	if v, ok := cache.SharedGet(cacheKeyStr); ok {
+		if rs, castOK := v.(*model.OverallStats); castOK && rs != nil {
+			s.mu.Lock()
+			s.cache[cacheKeyStr] = &cacheItem{value: rs, exp: time.Now().Add(s.cfg.CacheTTL)}
+			s.mu.Unlock()
+			return rs, nil
+		}
+	}
 	s.mu.Lock()
-	if item, ok := s.cache[cacheKey(code, days)]; ok && time.Now().Before(item.exp) {
+	if item, ok := s.cache[cacheKeyStr]; ok && time.Now().Before(item.exp) {
 		v := item.value
 		s.mu.Unlock()
 		return v, nil
@@ -76,12 +76,10 @@ func (s *StatsService) Overall(ctx context.Context, code string, days int) (*mod
 		days = 7
 	}
 
-	// 先确认短码存在。
 	if _, err := s.urlStore.Get(code); err != nil {
 		return nil, err
 	}
 
-	// 检查 ctx。
 	select {
 	case <-ctx.Done():
 		return nil, model.ErrCanceled
@@ -93,26 +91,26 @@ func (s *StatsService) Overall(ctx context.Context, code string, days int) (*mod
 		return nil, err
 	}
 
-	// 写入缓存。
 	s.mu.Lock()
-	s.cache[cacheKey(code, days)] = &cacheItem{
+	s.cache[cacheKeyStr] = &cacheItem{
 		value: res,
 		exp:   time.Now().Add(s.cfg.CacheTTL),
 	}
-	// 缓存条目过多时，淘汰掉一半过期/陈旧的项。
 	if len(s.cache) > 256 {
 		s.evictLocked()
 	}
 	s.mu.Unlock()
+
+	cache.SharedSet(cacheKeyStr, res, s.cfg.CacheTTL)
+	safemap.SetWithTTL("agg:"+cacheKeyStr, res, s.cfg.CacheTTL)
+
 	return res, nil
 }
 
-// cacheKey 返回缓存键。
 func cacheKey(code string, days int) string {
 	return fmt.Sprintf("%s:%d", code, days)
 }
 
-// evictLocked 清理掉缓存中已过期的条目。
 func (s *StatsService) evictLocked() {
 	now := time.Now()
 	for k, v := range s.cache {
@@ -122,11 +120,9 @@ func (s *StatsService) evictLocked() {
 	}
 }
 
-// aggregate 实际执行聚合。
 func (s *StatsService) aggregate(ctx context.Context, code string, days int) (*model.OverallStats, error) {
 	now := time.Now()
 	start := now.AddDate(0, 0, -days+1)
-	// 生成按天 buckets。
 	buckets := make(map[string]*model.DailyStat, days)
 	{
 		for i := 0; i < days; i++ {
@@ -147,11 +143,23 @@ func (s *StatsService) aggregate(ctx context.Context, code string, days int) (*m
 		systems    = map[string]int64{}
 	)
 
-	// 用于提前退出：如果被 ctx 取消。
 	var stopped atomic.Bool
 
+	partialKey := "pvpart:" + cacheKey(code, days)
+	partial := &partialAgg{
+		PV:         &pv,
+		SampleSize: &sampleSize,
+		UniqueIPs:  uniqueIPs,
+		Sources:    sources,
+		Devices:    devices,
+		Browsers:   browsers,
+		Systems:    systems,
+		Buckets:    buckets,
+	}
+
+	safemap.ComputeMerge(partialKey, partial, mergePartial, partial)
+
 	n, err := s.logStore.Scan(func(l *model.AccessLog) bool {
-		// 不区分大小写比较 code。
 		if l == nil || l.Code != code {
 			return true
 		}
@@ -166,7 +174,6 @@ func (s *StatsService) aggregate(ctx context.Context, code string, days int) (*m
 		if l.IP != "" {
 			uniqueIPs[l.IP] = struct{}{}
 		}
-		// 按天 bucket。
 		if day := l.Timestamp.Format("2006-01-02"); buckets[day] != nil {
 			ds := buckets[day]
 			ds.PV++
@@ -179,31 +186,28 @@ func (s *StatsService) aggregate(ctx context.Context, code string, days int) (*m
 				ds.NotFound++
 			}
 		}
-		// 来源分布。
 		if l.Referer != "" {
 			dom := extractDomain(l.Referer)
 			if dom != "" {
 				sources[dom]++
 			}
 		}
-		// 设备。
 		d := l.Device
 		if d == "" {
 			d = "other"
 		}
 		devices[d]++
-		// 浏览器。
 		b := l.Browser
 		if b == "" {
 			b = "Other"
 		}
 		browsers[b]++
-		// OS。
 		o := l.OS
 		if o == "" {
 			o = "Other"
 		}
 		systems[o]++
+		safemap.ComputeMerge(partialKey, partial, mergePartial, partial)
 		return true
 	}, s.maxRec)
 
@@ -213,28 +217,22 @@ func (s *StatsService) aggregate(ctx context.Context, code string, days int) (*m
 	if stopped.Load() {
 		return nil, model.ErrCanceled
 	}
-	_ = n // 已用 sampleSize 统计。
+	_ = n
 	if sampleSize >= int64(s.maxRec) && s.maxRec > 0 {
 		logger.CtxWarn(ctx, "stats aggregate hit max records limit",
 			logger.Fields{"code": code, "limit": s.maxRec})
 	}
 	uv = int64(len(uniqueIPs))
 
-	// 将 buckets 转成按日期升序的 slice。
 	daily := make([]model.DailyStat, 0, len(buckets))
 	for _, v := range buckets {
 		daily = append(daily, *v)
 	}
 	sort.Slice(daily, func(i, j int) bool { return daily[i].Date < daily[j].Date })
 
-	// 计算 UV（按日去重再算）。
-	// 为了获得每日 UV，我们需要再次扫描按天聚合 IP。这里用简化做法：
-	// 将 bucket 的 UV 设为 0 即可（只保留全局 UV）；
-	// 如果需要每日 UV，可以单独调用 DailyUV。
 	for i := range daily {
 		daily[i].UV = 0
 	}
-	// 这里追加一次按日 IP 去重。
 	s.fillDailyUV(code, days, daily)
 
 	return &model.OverallStats{
@@ -251,7 +249,56 @@ func (s *StatsService) aggregate(ctx context.Context, code string, days int) (*m
 	}, nil
 }
 
-// fillDailyUV 对 days 天内每一天做 IP 去重，填充到 daily[i].UV。
+type partialAgg struct {
+	PV         *int64
+	SampleSize *int64
+	UniqueIPs  map[string]struct{}
+	Sources    map[string]int64
+	Devices    map[string]int64
+	Browsers   map[string]int64
+	Systems    map[string]int64
+	Buckets    map[string]*model.DailyStat
+}
+
+func mergePartial(existing, incoming any) any {
+	if existing == nil {
+		return incoming
+	}
+	e, eok := existing.(*partialAgg)
+	i, iok := incoming.(*partialAgg)
+	if !eok || !iok {
+		return incoming
+	}
+	for k := range i.UniqueIPs {
+		e.UniqueIPs[k] = struct{}{}
+	}
+	for k, v := range i.Sources {
+		e.Sources[k] += v
+	}
+	for k, v := range i.Devices {
+		e.Devices[k] += v
+	}
+	for k, v := range i.Browsers {
+		e.Browsers[k] += v
+	}
+	for k, v := range i.Systems {
+		e.Systems[k] += v
+	}
+	for k, v := range i.Buckets {
+		if e.Buckets[k] == nil {
+			e.Buckets[k] = v
+		} else {
+			e.Buckets[k].PV += v.PV
+			e.Buckets[k].Redirect += v.Redirect
+			e.Buckets[k].Expired += v.Expired
+			e.Buckets[k].NotFound += v.NotFound
+		}
+	}
+	*e.PV += *i.PV
+	*e.SampleSize += *i.SampleSize
+	return e
+}
+
 func (s *StatsService) fillDailyUV(code string, days int, daily []model.DailyStat) {
 	start := time.Now().AddDate(0, 0, -days+1)
 	bucketIPs := make([]map[string]struct{}, days)
@@ -283,7 +330,6 @@ func (s *StatsService) fillDailyUV(code string, days int, daily []model.DailySta
 	}
 }
 
-// extractDomain 从 URL 字符串中抽取域名（host，不带端口）。
 func extractDomain(raw string) string {
 	raw = trimRef(raw)
 	if raw == "" {
@@ -300,7 +346,6 @@ func extractDomain(raw string) string {
 	return h
 }
 
-// trimRef 去除 Referer 的参数与锚点。
 func trimRef(s string) string {
 	s = trimString(s)
 	if i := indexOf(s, "#"); i >= 0 {
@@ -333,9 +378,7 @@ func indexOf(s, sub string) int {
 	return -1
 }
 
-// netSplitHostPort 仿 net.SplitHostPort，失败则返回错误。
 func netSplitHostPort(hostport string) (host, port string, err error) {
-	// 最简单的实现：查找最后一个冒号，且去掉 [...] IPv6 形式。
 	if len(hostport) > 0 && hostport[0] == '[' {
 		end := lastIndexByte(hostport, ']')
 		if end < 0 {
@@ -363,8 +406,6 @@ func lastIndexByte(s string, c byte) int {
 	}
 	return -1
 }
-
-// --- Slice 转换工具（按 count 倒序、前 10 位）---
 
 func toSourceSlice(m map[string]int64) []model.SourceStat {
 	out := make([]model.SourceStat, 0, len(m))

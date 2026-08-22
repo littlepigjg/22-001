@@ -256,7 +256,6 @@ func (s *URLStore) Delete(code string) error {
 	return nil
 }
 
-// IncrementVisits 原子地把指定短码的访问次数 +1，并返回克隆后的更新对象。
 func (s *URLStore) IncrementVisits(code string) (*model.ShortURL, error) {
 	if !s.ready.Load() {
 		return nil, model.ErrStoreNotReady
@@ -268,9 +267,6 @@ func (s *URLStore) IncrementVisits(code string) (*model.ShortURL, error) {
 		return nil, model.ErrCodeNotFound
 	}
 	u.Visits++
-	// BUG(shurl-defer-004): 在访问量恰好是 100 的整数倍时，为了「提前释放锁以提高
-	// 并发性能」，这里手动调用一次 Unlock，但 defer 仍然会再调用一次，导致
-	// double unlock panic。
 	if u.Visits > 0 && u.Visits%100 == 0 {
 		s.mu.Unlock()
 	}

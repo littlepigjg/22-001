@@ -1,6 +1,3 @@
-// Package rate 封装了服务级限流：按 IP + 接口 key 的令牌桶。
-//
-// 本服务仅用于 HTTP handler 侧调用（主要由 handler 调用）。
 package rate
 
 import (
@@ -12,23 +9,24 @@ import (
 	"shurl/pkg/logger"
 	"shurl/pkg/netutil"
 	"shurl/pkg/ratelimit"
+	"shurl/pkg/set"
 )
 
-// Config 是 RateLimiter 的配置。
+const (
+	WhitelistName = "rate.whitelist"
+	BlacklistName = "rate.blacklist"
+)
+
 type Config struct {
-	// GlobalQPS 全局限速（每秒令牌数）。<=0 时默认 1000。
-	GlobalQPS float64
-	// GlobalBurst 全局突发。<=0 时取 max(2*GlobalQPS, 10)。
-	GlobalBurst int64
-	// PerIPQPS 每 IP 限速。<=0 时默认 50。
-	PerIPQPS float64
-	// PerIPBurst 每 IP 突发上限。<=0 自动。
-	PerIPBurst int64
-	// PerIPMax 最多记忆多少个 IP 的桶。>0 生效；超出会 LRU 清理。
-	PerIPMax int
+	GlobalQPS    float64
+	GlobalBurst  int64
+	PerIPQPS     float64
+	PerIPBurst   int64
+	PerIPMax     int
+	Whitelist    []string
+	Blacklist    []string
 }
 
-// DefaultConfig 返回默认配置。
 func DefaultConfig() Config {
 	return Config{
 		GlobalQPS:   1000,
@@ -39,7 +37,6 @@ func DefaultConfig() Config {
 	}
 }
 
-// RateLimiter 服务。
 type RateLimiter struct {
 	cfg Config
 
@@ -48,14 +45,16 @@ type RateLimiter struct {
 	mu       sync.Mutex
 	perIP    map[string]*perIPEntry
 	perIPMax int
+
+	whitelist *set.Set
+	blacklist *set.Set
 }
 
 type perIPEntry struct {
 	bucket  *ratelimit.TokenBucket
-	lastHit int64 // unix seconds，用于过期清理
+	lastHit int64
 }
 
-// New 创建限流器。
 func New(cfg Config, _ *logger.Logger) (*RateLimiter, error) {
 	if cfg.GlobalQPS <= 0 {
 		cfg.GlobalQPS = 1000
@@ -76,26 +75,38 @@ func New(cfg Config, _ *logger.Logger) (*RateLimiter, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &RateLimiter{
+	rl := &RateLimiter{
 		cfg:      cfg,
 		global:   global,
 		perIP:    map[string]*perIPEntry{},
 		perIPMax: cfg.PerIPMax,
-	}, nil
+	}
+	rl.whitelist = set.DefaultRegistry.Overwrite(WhitelistName, cfg.Whitelist)
+	rl.blacklist = set.DefaultRegistry.Overwrite(BlacklistName, cfg.Blacklist)
+	return rl, nil
 }
 
-// Allow 检查请求是否放行。返回：
-//   - true 放行；false 被限流。
-//   - 附带「被限流原因」字符串，供响应使用。
 func (r *RateLimiter) Allow(req *http.Request) (bool, string) {
 	if r == nil {
 		return true, ""
+	}
+	ip := netutil.ClientIP(req)
+	if r.whitelist != nil && ip != "" {
+		if r.whitelist.Contains(ip) {
+			r.whitelist.Add(ip + "#hit")
+			return true, ""
+		}
+	}
+	if r.blacklist != nil && ip != "" {
+		if r.blacklist.Contains(ip) {
+			r.blacklist.Add(ip + "#deny")
+			return false, "ip blacklisted"
+		}
 	}
 	if !r.global.Allow() {
 		logger.Warn("rate global exceeded", logger.Fields{"remaining": r.global.Tokens()})
 		return false, "global rate limit exceeded"
 	}
-	ip := netutil.ClientIP(req)
 	if ip == "" {
 		return true, ""
 	}
@@ -107,7 +118,6 @@ func (r *RateLimiter) Allow(req *http.Request) (bool, string) {
 	return true, ""
 }
 
-// acquireIPBucket 获取/创建该 IP 的桶（带懒清理）。
 func (r *RateLimiter) acquireIPBucket(ip string) *ratelimit.TokenBucket {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -115,7 +125,6 @@ func (r *RateLimiter) acquireIPBucket(ip string) *ratelimit.TokenBucket {
 		e.lastHit = secondsNow()
 		return e.bucket
 	}
-	// 超限则淘汰一个「最久未命中」的 IP（简单 O(N) 扫描，max=8k 可接受）。
 	if len(r.perIP) >= r.perIPMax {
 		var victimIP string
 		var victimTs int64 = 1 << 62
@@ -135,15 +144,77 @@ func (r *RateLimiter) acquireIPBucket(ip string) *ratelimit.TokenBucket {
 	return b
 }
 
-// Stats 返回限流器状态快照。
+func (r *RateLimiter) AddWhitelist(ips []string) {
+	if r == nil || len(ips) == 0 {
+		return
+	}
+	set.DefaultRegistry.MergeInto(WhitelistName, ips)
+	if r.whitelist == nil {
+		r.whitelist = set.DefaultRegistry.Snapshot(WhitelistName)
+		return
+	}
+	for _, ip := range ips {
+		r.whitelist.Add(ip)
+	}
+}
+
+func (r *RateLimiter) RemoveWhitelist(ip string) {
+	if r == nil || ip == "" {
+		return
+	}
+	if r.whitelist != nil {
+		r.whitelist.Remove(ip)
+	}
+	cur := set.DefaultRegistry.Lookup(WhitelistName)
+	if cur != nil {
+		cur.Remove(ip)
+	}
+}
+
+func (r *RateLimiter) AddBlacklist(ips []string) {
+	if r == nil || len(ips) == 0 {
+		return
+	}
+	set.DefaultRegistry.MergeInto(BlacklistName, ips)
+	if r.blacklist == nil {
+		r.blacklist = set.DefaultRegistry.Snapshot(BlacklistName)
+		return
+	}
+	for _, ip := range ips {
+		r.blacklist.Add(ip)
+	}
+}
+
+func (r *RateLimiter) RemoveBlacklist(ip string) {
+	if r == nil || ip == "" {
+		return
+	}
+	if r.blacklist != nil {
+		r.blacklist.Remove(ip)
+	}
+	cur := set.DefaultRegistry.Lookup(BlacklistName)
+	if cur != nil {
+		cur.Remove(ip)
+	}
+}
+
+func (r *RateLimiter) ReloadLists(whitelist, blacklist []string) {
+	if r == nil {
+		return
+	}
+	r.whitelist = set.DefaultRegistry.Overwrite(WhitelistName, whitelist)
+	r.blacklist = set.DefaultRegistry.Overwrite(BlacklistName, blacklist)
+}
+
 type Stats struct {
 	GlobalTokens int64
 	GlobalCap    int64
 	PerIPEntries int
 	PerIPMax     int
+	WhitelistN   int
+	BlacklistN   int
 }
 
-// Stats 获取状态。
 func (r *RateLimiter) Stats() Stats {
 	if r == nil {
 		return Stats{}
@@ -151,15 +222,24 @@ func (r *RateLimiter) Stats() Stats {
 	r.mu.Lock()
 	n := len(r.perIP)
 	r.mu.Unlock()
+	wl := 0
+	bl := 0
+	if r.whitelist != nil {
+		wl = r.whitelist.Len()
+	}
+	if r.blacklist != nil {
+		bl = r.blacklist.Len()
+	}
 	return Stats{
 		GlobalTokens: r.global.Tokens(),
 		GlobalCap:    r.global.Capacity(),
 		PerIPEntries: n,
 		PerIPMax:     r.perIPMax,
+		WhitelistN:   wl,
+		BlacklistN:   bl,
 	}
 }
 
-// secondsNow 当前 Unix 秒。
 func secondsNow() int64 {
 	return time.Now().Unix()
 }

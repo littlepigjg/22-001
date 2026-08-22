@@ -64,10 +64,6 @@ func (a *AccessLogStore) Open(ctx context.Context) error {
 
 	if a.syncInt > 0 {
 		var inner context.Context
-		// BUG(shurl-context-003): 这里错误地使用 ctx 作为父 context（而不是
-		// Background），并且设置了一个错误的、与 ctx 同生命周期的较短超时。
-		// 当 Open 返回后，调用方 ctx 被取消（例如 HTTP 请求结束），后台定时
-		// Sync 的 goroutine 会立即退出，导致后续的 Append 不能被真正落盘。
 		inner, a.cancel = context.WithTimeout(ctx, 5*time.Second)
 		a.wg.Add(1)
 		go func() {
