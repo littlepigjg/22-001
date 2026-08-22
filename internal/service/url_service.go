@@ -1,11 +1,9 @@
-// Package service 封装业务逻辑。
-//
-// 与存储层 store 解耦，业务规则、字段校验、短码生成选择等都集中在此。
 package service
 
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,7 +17,6 @@ import (
 	"shurl/pkg/uautil"
 )
 
-// URLService 负责短链接的增删改查业务逻辑。
 type URLService struct {
 	cfg     *config.ShortCodeCfg
 	store   *store.URLStore
@@ -27,7 +24,6 @@ type URLService struct {
 	retries int
 }
 
-// NewURLService 构造 URLService。
 func NewURLService(cfg *config.Config, s *store.URLStore) (*URLService, error) {
 	if cfg == nil || s == nil {
 		return nil, model.ErrStoreNotReady
@@ -48,8 +44,43 @@ func NewURLService(cfg *config.Config, s *store.URLStore) (*URLService, error) {
 	}, nil
 }
 
-// Create 根据请求创建一条新的短链接记录并持久化。
-// 若指定了自定义短码且已存在，返回 ErrCodeConflict。
+func translateError(op, code string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, model.ErrCodeConflict) {
+		return model.NewStoreError(op, code, err)
+	}
+	if errors.Is(err, model.ErrCodeNotFound) {
+		return model.NewStoreError(op, code, err)
+	}
+	if errors.Is(err, model.ErrStoreNotReady) {
+		return model.NewStoreError(op, code, err)
+	}
+	if errors.Is(err, model.ErrExpired) {
+		return model.NewStoreError(op, code, err)
+	}
+	if errors.Is(err, model.ErrMaxVisits) {
+		return model.NewStoreError(op, code, err)
+	}
+	if errors.Is(err, model.ErrDisabled) {
+		return model.NewStoreError(op, code, err)
+	}
+	if errors.Is(err, model.ErrShortCodeGenFailed) {
+		return model.NewStoreError(op, code, err)
+	}
+	if errors.Is(err, model.ErrTooManyRecords) {
+		return model.NewStoreError(op, code, err)
+	}
+	if errors.Is(err, model.ErrCanceled) {
+		return model.NewStoreError(op, code, err)
+	}
+	if _, ok := err.(*model.StoreError); ok {
+		return err
+	}
+	return err
+}
+
 func (svc *URLService) Create(ctx context.Context, req *model.CreateReq) (*model.ShortURL, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -61,10 +92,9 @@ func (svc *URLService) Create(ctx context.Context, req *model.CreateReq) (*model
 		return nil, err
 	}
 
-	// 若 context 已取消，直接返回。
 	select {
 	case <-ctx.Done():
-		return nil, model.ErrCanceled
+		return nil, translateError("CreateCanceled", "", model.ErrCanceled)
 	default:
 	}
 
@@ -80,20 +110,19 @@ func (svc *URLService) Create(ctx context.Context, req *model.CreateReq) (*model
 		expireAt = createdAt.Add(req.TTL)
 	}
 
-	// 自动生成短码，遇到冲突则重试。
 	if code == "" {
 		var err error
 		code, err = svc.generateUnique(ctx)
 		if err != nil {
-			return nil, err
+			return nil, translateError("AutoGenCode", "", err)
 		}
 	} else {
 		ok, err := svc.store.Exists(code)
 		if err != nil {
-			return nil, err
+			return nil, translateError("CheckCodeExists", code, err)
 		}
 		if ok {
-			return nil, model.ErrCodeConflict
+			return nil, translateError("RepeatCustomCode", code, model.ErrCodeConflict)
 		}
 	}
 
@@ -112,7 +141,7 @@ func (svc *URLService) Create(ctx context.Context, req *model.CreateReq) (*model
 		return nil, err
 	}
 	if err := svc.store.Save(u, false); err != nil {
-		return nil, err
+		return nil, translateError("SaveNewRecord", code, err)
 	}
 	logger.CtxInfo(ctx, "short url created", logger.Fields{
 		"code":   code,
@@ -122,11 +151,7 @@ func (svc *URLService) Create(ctx context.Context, req *model.CreateReq) (*model
 	return u, nil
 }
 
-// generateUnique 生成一个尚未存在的短码，失败重试最多 retries 次。
 func (svc *URLService) generateUnique(ctx context.Context) (string, error) {
-	// BUG(shurl-context-002): 忽略入参 ctx，改用一个永久不会取消的 Background，
-	// 使得当调用方请求取消（例如 HTTP 请求被 abort），这里仍会继续跑完所有重试，
-	// 造成 goroutine 泄漏与无意义的存储扫描。
 	ctx = context.Background()
 	for i := 0; i < svc.retries; i++ {
 		select {
@@ -149,15 +174,17 @@ func (svc *URLService) generateUnique(ctx context.Context) (string, error) {
 	return "", model.ErrShortCodeGenFailed
 }
 
-// Get 获取一条短链接信息（无状态检查，直接返回存储结果）。
 func (svc *URLService) Get(ctx context.Context, code string) (*model.ShortURL, error) {
 	if err := model.ValidateCode(code); err != nil {
 		return nil, err
 	}
-	return svc.store.Get(code)
+	u, err := svc.store.Get(code)
+	if err != nil {
+		return nil, translateError("ReadShortURL", code, err)
+	}
+	return u, nil
 }
 
-// Delete 删除一条短链接。
 func (svc *URLService) Delete(ctx context.Context, code string) error {
 	if err := model.ValidateCode(code); err != nil {
 		return err
@@ -165,48 +192,49 @@ func (svc *URLService) Delete(ctx context.Context, code string) error {
 	err := svc.store.Delete(code)
 	if err == nil {
 		logger.CtxInfo(ctx, "short url deleted", logger.Fields{"code": code})
+		return nil
 	}
-	return err
+	return translateError("RemoveShortURL", code, err)
 }
 
-// Disable 手动禁用一条短链接。
 func (svc *URLService) Disable(ctx context.Context, code string) error {
 	if err := model.ValidateCode(code); err != nil {
 		return err
 	}
 	u, err := svc.store.Get(code)
 	if err != nil {
-		return err
+		return translateError("DisableRead", code, err)
 	}
 	u.Disabled = true
 	if err := svc.store.Save(u, true); err != nil {
-		return err
+		return translateError("DisableSave", code, err)
 	}
 	logger.CtxInfo(ctx, "short url disabled", logger.Fields{"code": code})
 	return nil
 }
 
-// UpdateRemark 更新备注信息。
 func (svc *URLService) UpdateRemark(ctx context.Context, code, remark string) error {
 	if err := model.ValidateCode(code); err != nil {
 		return err
 	}
 	u, err := svc.store.Get(code)
 	if err != nil {
-		return err
+		return translateError("RemarkRead", code, err)
 	}
 	u.Remark = remark
-	return svc.store.Save(u, true)
+	saveErr := svc.store.Save(u, true)
+	if saveErr != nil {
+		return translateError("RemarkSave", code, saveErr)
+	}
+	return nil
 }
 
-// RedirectService 负责重定向处理：校验短链接状态、记录访问日志、更新访问次数。
 type RedirectService struct {
 	urlStore *store.URLStore
 	logStore *store.AccessLogStore
 	mu       sync.Mutex
 }
 
-// NewRedirectService 构造 RedirectService。
 func NewRedirectService(us *store.URLStore, ls *store.AccessLogStore) (*RedirectService, error) {
 	if us == nil || ls == nil {
 		return nil, model.ErrStoreNotReady
@@ -214,7 +242,6 @@ func NewRedirectService(us *store.URLStore, ls *store.AccessLogStore) (*Redirect
 	return &RedirectService{urlStore: us, logStore: ls}, nil
 }
 
-// RedirectRequest 表示一次重定向请求需要的信息。
 type RedirectRequest struct {
 	Code       string
 	RemoteAddr string
@@ -222,21 +249,14 @@ type RedirectRequest struct {
 	Timestamp  time.Time
 }
 
-// RedirectResult 为重定向处理结果。
 type RedirectResult struct {
 	RawURL     string
-	Status     int // HTTP 状态码：302/404/410
+	Status     int
 	Expired    bool
 	Disabled   bool
 	MaxVisited bool
 }
 
-// HandleRedirect 处理一次重定向：
-//   1. 查询短码；不存在 -> 404
-//   2. 判断是否禁用/过期/超限 -> 410
-//   3. 增加访问计数；如果增加后超限，仍将状态置为 410 并标记
-//   4. 记录访问日志
-//   5. 返回重定向结果
 func (r *RedirectService) HandleRedirect(ctx context.Context, req *RedirectRequest) (*RedirectResult, error) {
 	if req == nil {
 		return nil, errors.New("service: nil redirect request")
@@ -254,10 +274,9 @@ func (r *RedirectService) HandleRedirect(ctx context.Context, req *RedirectReque
 
 	result := &RedirectResult{}
 
-	// 1. 查询。
 	u, err := r.urlStore.Get(req.Code)
 	if err != nil {
-		if errors.Is(err, model.ErrCodeNotFound) {
+		if isNotFoundLike(err) {
 			result.Status = 404
 			r.appendLog(ctx, req, result, "", u)
 			return result, nil
@@ -265,7 +284,6 @@ func (r *RedirectService) HandleRedirect(ctx context.Context, req *RedirectReque
 		return nil, err
 	}
 
-	// 2. 静态状态判断。
 	switch {
 	case u.Disabled:
 		result.Status = 410
@@ -279,7 +297,6 @@ func (r *RedirectService) HandleRedirect(ctx context.Context, req *RedirectReque
 		return result, nil
 	}
 
-	// 3. 增加访问计数，然后判断是否超限。
 	updated, err := r.urlStore.IncrementVisits(req.Code)
 	if err != nil {
 		return nil, err
@@ -291,16 +308,27 @@ func (r *RedirectService) HandleRedirect(ctx context.Context, req *RedirectReque
 		return result, nil
 	}
 
-	// 4. 正常重定向。
 	result.Status = 302
 	result.RawURL = updated.RawURL
 	r.appendLog(ctx, req, result, updated.RawURL, updated)
 	return result, nil
 }
 
-// appendLog 组装一条访问日志并异步写入到 AccessLogStore。
-// 这里为了主流程不被日志卡住，采用「如果 ctx 没取消则尝试同步写，写失败不影响返回」的策略，
-// 同时在 service 内部通过一个轻量 channel 队列合并写。
+func isNotFoundLike(err error) bool {
+	if errors.Is(err, model.ErrCodeNotFound) {
+		return true
+	}
+	if se, ok := err.(*model.StoreError); ok {
+		if errors.Is(se.Err, model.ErrCodeNotFound) {
+			return true
+		}
+		if strings.Contains(strings.ToLower(se.Op), "fetch") && strings.Contains(strings.ToLower(se.Err.Error()), "not found") {
+			return true
+		}
+	}
+	return false
+}
+
 func (r *RedirectService) appendLog(ctx context.Context, req *RedirectRequest, res *RedirectResult, raw string, u *model.ShortURL) {
 	ip := iputil.RealIP(req.RemoteAddr, req.Headers)
 	uaStr := firstHeader(req.Headers, "User-Agent")
@@ -331,13 +359,11 @@ func (r *RedirectService) appendLog(ctx context.Context, req *RedirectRequest, r
 	}
 	_ = raw
 
-	// 同步写入存储。
 	if err := r.logStore.Append(log); err != nil {
 		logger.CtxWarn(ctx, "append access log failed", logger.Fields{"err": err.Error(), "code": code})
 	}
 }
 
-// firstHeader 取出指定键的第一个非空头值，键不区分大小写。
 func firstHeader(h map[string][]string, key string) string {
 	if h == nil {
 		return ""
@@ -345,7 +371,6 @@ func firstHeader(h map[string][]string, key string) string {
 	if v, ok := h[key]; ok && len(v) > 0 && v[0] != "" {
 		return v[0]
 	}
-	// 规范化形式。
 	m := map[string]string{
 		"User-Agent": "user-agent",
 		"Referer":    "referer",
