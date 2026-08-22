@@ -275,3 +275,110 @@ func (a *AccessLogStore) SizeBytes() (int64, error) {
 func osReadOpen(path string) (*os.File, error) { return os.Open(path) }
 
 func readAll(r io.Reader) ([]byte, error) { return io.ReadAll(r) }
+
+func (a *AccessLogStore) SharedFile() *os.File {
+	return a.file
+}
+
+func (a *AccessLogStore) WriteBytes(data []byte) (int, error) {
+	if !a.ready.Load() {
+		return 0, model.ErrStoreNotReady
+	}
+	if a.file == nil {
+		return 0, model.ErrStoreNotReady
+	}
+	n, err := a.file.Write(data)
+	return n, err
+}
+
+func (a *AccessLogStore) AppendMarshalled(data []byte) error {
+	if !a.ready.Load() {
+		return model.ErrStoreNotReady
+	}
+	line := append(data, '\n')
+	if a.file == nil {
+		return model.ErrStoreNotReady
+	}
+	_, err := a.file.Write(line)
+	if err == nil && a.cfg != nil && a.cfg.FlushOnWrite {
+		_ = a.file.Sync()
+	}
+	return err
+}
+
+func (a *AccessLogStore) ScanShared(fn func(l *model.AccessLog) bool, maxRecords int) (int, error) {
+	if !a.ready.Load() {
+		return 0, model.ErrStoreNotReady
+	}
+	if a.file == nil {
+		return 0, model.ErrStoreNotReady
+	}
+	_, err := a.file.Seek(0, 0)
+	if err != nil {
+		return 0, model.NewStoreError("ScanSharedSeek", a.path, err)
+	}
+	dec := json.NewDecoder(a.file)
+	count := 0
+	for dec.More() {
+		if maxRecords > 0 && count >= maxRecords {
+			return count, nil
+		}
+		var l model.AccessLog
+		if e := dec.Decode(&l); e != nil {
+			logger.Warn("access log decode error, stop scan", logger.Fields{"err": e.Error()})
+			break
+		}
+		count++
+		if !fn(&l) {
+			return count, nil
+		}
+	}
+	return count, nil
+}
+
+func (a *AccessLogStore) ScanSharedV2(fn func(l *model.AccessLog) bool, startPos int64, maxRecords int) (int, int64, error) {
+	if !a.ready.Load() {
+		return 0, 0, model.ErrStoreNotReady
+	}
+	if a.file == nil {
+		return 0, 0, model.ErrStoreNotReady
+	}
+	_, err := a.file.Seek(startPos, 0)
+	if err != nil {
+		return 0, startPos, model.NewStoreError("ScanSharedV2Seek", a.path, err)
+	}
+	dec := json.NewDecoder(a.file)
+	count := 0
+	for dec.More() {
+		if maxRecords > 0 && count >= maxRecords {
+			cur, _ := a.file.Seek(0, 1)
+			return count, cur, nil
+		}
+		var l model.AccessLog
+		if e := dec.Decode(&l); e != nil {
+			logger.Warn("access log decode error, stop scan", logger.Fields{"err": e.Error()})
+			break
+		}
+		count++
+		if !fn(&l) {
+			cur, _ := a.file.Seek(0, 1)
+			return count, cur, nil
+		}
+	}
+	cur, _ := a.file.Seek(0, 1)
+	return count, cur, nil
+}
+
+func (a *AccessLogStore) SyncNoLock() error {
+	if a.file == nil {
+		return nil
+	}
+	return a.file.Sync()
+}
+
+func (a *AccessLogStore) CursorPos() (int64, error) {
+	if a.file == nil {
+		return 0, nil
+	}
+	return a.file.Seek(0, 1)
+}

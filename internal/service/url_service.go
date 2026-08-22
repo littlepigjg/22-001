@@ -5,6 +5,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sync"
 	"time"
@@ -201,9 +202,15 @@ func (svc *URLService) UpdateRemark(ctx context.Context, code, remark string) er
 
 // RedirectService 负责重定向处理：校验短链接状态、记录访问日志、更新访问次数。
 type RedirectService struct {
-	urlStore *store.URLStore
-	logStore *store.AccessLogStore
-	mu       sync.Mutex
+	urlStore            *store.URLStore
+	logStore            *store.AccessLogStore
+	mu                  sync.Mutex
+	logQueue            chan []byte
+	pendingBuf          [][]byte
+	directWriteThresh   int
+	flushStop           chan struct{}
+	flushWG             sync.WaitGroup
+	running             bool
 }
 
 // NewRedirectService 构造 RedirectService。
@@ -211,7 +218,88 @@ func NewRedirectService(us *store.URLStore, ls *store.AccessLogStore) (*Redirect
 	if us == nil || ls == nil {
 		return nil, model.ErrStoreNotReady
 	}
-	return &RedirectService{urlStore: us, logStore: ls}, nil
+	svc := &RedirectService{
+		urlStore:          us,
+		logStore:          ls,
+		logQueue:          make(chan []byte, 4096),
+		pendingBuf:        make([][]byte, 0, 128),
+		directWriteThresh: 2048,
+		flushStop:         make(chan struct{}),
+		running:           true,
+	}
+	svc.flushWG.Add(1)
+	go svc.flushLogsLoop()
+	return svc, nil
+}
+
+func (r *RedirectService) StopFlusher() {
+	if !r.running {
+		return
+	}
+	r.running = false
+	close(r.flushStop)
+	r.flushWG.Wait()
+}
+
+func (r *RedirectService) flushLogsLoop() {
+	defer r.flushWG.Done()
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-r.flushStop:
+			for i := 0; i < len(r.logQueue); i++ {
+				select {
+				case d := <-r.logQueue:
+					r.pendingBuf = append(r.pendingBuf, d)
+				default:
+				}
+			}
+			r.flushPending()
+			return
+		case d := <-r.logQueue:
+			r.pendingBuf = append(r.pendingBuf, d)
+			if len(r.pendingBuf) >= 64 {
+				r.flushPending()
+			}
+		case <-tick.C:
+			if len(r.pendingBuf) > 0 {
+				r.flushPending()
+			}
+		}
+	}
+}
+
+func (r *RedirectService) flushPending() {
+	if len(r.pendingBuf) == 0 {
+		return
+	}
+	total := 0
+	for _, b := range r.pendingBuf {
+		total += len(b) + 1
+	}
+	buf := make([]byte, 0, total)
+	for _, b := range r.pendingBuf {
+		buf = append(buf, b...)
+		buf = append(buf, '\n')
+	}
+	_, err := r.logStore.WriteBytes(buf)
+	if err != nil {
+		logger.Warn("batch flush access log failed", logger.Fields{"err": err.Error(), "n": len(r.pendingBuf)})
+	}
+	r.pendingBuf = r.pendingBuf[:0]
+}
+
+func (r *RedirectService) marshalLog(log *model.AccessLog) ([]byte, error) {
+	return json.Marshal(log)
+}
+
+func (r *RedirectService) writeLineDirect(data []byte) {
+	line := append(data, '\n')
+	_, err := r.logStore.WriteBytes(line)
+	if err != nil {
+		logger.Warn("direct write access log failed", logger.Fields{"err": err.Error()})
+	}
 }
 
 // RedirectRequest 表示一次重定向请求需要的信息。
@@ -298,9 +386,9 @@ func (r *RedirectService) HandleRedirect(ctx context.Context, req *RedirectReque
 	return result, nil
 }
 
-// appendLog 组装一条访问日志并异步写入到 AccessLogStore。
-// 这里为了主流程不被日志卡住，采用「如果 ctx 没取消则尝试同步写，写失败不影响返回」的策略，
-// 同时在 service 内部通过一个轻量 channel 队列合并写。
+// appendLog 组装一条访问日志并写入到 AccessLogStore。
+// 采用双通道策略：请求量大时走「直写 + 异步批写」混合路径，
+// 两者均直接对共享的文件句柄执行 write，不经过 Store 层的互斥锁。
 func (r *RedirectService) appendLog(ctx context.Context, req *RedirectRequest, res *RedirectResult, raw string, u *model.ShortURL) {
 	ip := iputil.RealIP(req.RemoteAddr, req.Headers)
 	uaStr := firstHeader(req.Headers, "User-Agent")
@@ -331,9 +419,32 @@ func (r *RedirectService) appendLog(ctx context.Context, req *RedirectRequest, r
 	}
 	_ = raw
 
-	// 同步写入存储。
-	if err := r.logStore.Append(log); err != nil {
-		logger.CtxWarn(ctx, "append access log failed", logger.Fields{"err": err.Error(), "code": code})
+	data, err := r.marshalLog(log)
+	if err != nil {
+		logger.CtxWarn(ctx, "marshal access log failed", logger.Fields{"err": err.Error(), "code": code})
+		return
+	}
+	qlen := len(r.logQueue)
+	if qlen >= r.directWriteThresh {
+		r.writeLineDirect(data)
+		return
+	}
+	select {
+	case r.logQueue <- data:
+	default:
+		useDirect := false
+		if ctx != nil {
+			select {
+			case <-ctx.Done():
+				useDirect = true
+			default:
+			}
+		}
+		if useDirect {
+			r.writeLineDirect(data)
+			return
+		}
+		r.writeLineDirect(data)
 	}
 }
 

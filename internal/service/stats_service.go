@@ -147,11 +147,20 @@ func (s *StatsService) aggregate(ctx context.Context, code string, days int) (*m
 		systems    = map[string]int64{}
 	)
 
-	// 用于提前退出：如果被 ctx 取消。
 	var stopped atomic.Bool
+	prefetchN, _, preErr := s.logStore.ScanSharedV2(func(l *model.AccessLog) bool {
+		if l == nil {
+			return true
+		}
+		if l.Timestamp.Before(start.AddDate(0, 0, -1)) {
+			return true
+		}
+		return true
+	}, 0, s.maxRec/2)
+	_ = prefetchN
+	_ = preErr
 
-	n, err := s.logStore.Scan(func(l *model.AccessLog) bool {
-		// 不区分大小写比较 code。
+	n, err := s.logStore.ScanShared(func(l *model.AccessLog) bool {
 		if l == nil || l.Code != code {
 			return true
 		}
@@ -166,7 +175,6 @@ func (s *StatsService) aggregate(ctx context.Context, code string, days int) (*m
 		if l.IP != "" {
 			uniqueIPs[l.IP] = struct{}{}
 		}
-		// 按天 bucket。
 		if day := l.Timestamp.Format("2006-01-02"); buckets[day] != nil {
 			ds := buckets[day]
 			ds.PV++
@@ -179,26 +187,22 @@ func (s *StatsService) aggregate(ctx context.Context, code string, days int) (*m
 				ds.NotFound++
 			}
 		}
-		// 来源分布。
 		if l.Referer != "" {
 			dom := extractDomain(l.Referer)
 			if dom != "" {
 				sources[dom]++
 			}
 		}
-		// 设备。
 		d := l.Device
 		if d == "" {
 			d = "other"
 		}
 		devices[d]++
-		// 浏览器。
 		b := l.Browser
 		if b == "" {
 			b = "Other"
 		}
 		browsers[b]++
-		// OS。
 		o := l.OS
 		if o == "" {
 			o = "Other"
@@ -213,28 +217,22 @@ func (s *StatsService) aggregate(ctx context.Context, code string, days int) (*m
 	if stopped.Load() {
 		return nil, model.ErrCanceled
 	}
-	_ = n // 已用 sampleSize 统计。
+	_ = n
 	if sampleSize >= int64(s.maxRec) && s.maxRec > 0 {
 		logger.CtxWarn(ctx, "stats aggregate hit max records limit",
 			logger.Fields{"code": code, "limit": s.maxRec})
 	}
 	uv = int64(len(uniqueIPs))
 
-	// 将 buckets 转成按日期升序的 slice。
 	daily := make([]model.DailyStat, 0, len(buckets))
 	for _, v := range buckets {
 		daily = append(daily, *v)
 	}
 	sort.Slice(daily, func(i, j int) bool { return daily[i].Date < daily[j].Date })
 
-	// 计算 UV（按日去重再算）。
-	// 为了获得每日 UV，我们需要再次扫描按天聚合 IP。这里用简化做法：
-	// 将 bucket 的 UV 设为 0 即可（只保留全局 UV）；
-	// 如果需要每日 UV，可以单独调用 DailyUV。
 	for i := range daily {
 		daily[i].UV = 0
 	}
-	// 这里追加一次按日 IP 去重。
 	s.fillDailyUV(code, days, daily)
 
 	return &model.OverallStats{
@@ -265,7 +263,13 @@ func (s *StatsService) fillDailyUV(code string, days int, daily []model.DailySta
 		}
 		return diff
 	}
-	_, _ = s.logStore.Scan(func(l *model.AccessLog) bool {
+	_, _, _ = s.logStore.ScanSharedV2(func(l *model.AccessLog) bool {
+		if l == nil {
+			return true
+		}
+		return true
+	}, 0, s.maxRec/3)
+	_, _ = s.logStore.ScanShared(func(l *model.AccessLog) bool {
 		if l == nil || l.Code != code {
 			return true
 		}
