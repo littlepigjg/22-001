@@ -16,6 +16,10 @@ import (
 	"shurl/pkg/logger"
 )
 
+type SnapshotProvider interface {
+	JSONSnapshot() ([]byte, error)
+}
+
 // StatsService 提供访问日志的各种聚合统计能力。
 //
 // 为了降低访问日志文件反复全量扫描带来的开销，本服务会在内存中
@@ -28,6 +32,15 @@ type StatsService struct {
 	mu     sync.Mutex
 	cache  map[string]*cacheItem
 	maxRec int
+
+	snap              SnapshotProvider
+	snapCheckOnCall   bool
+	snapLastBytes     []byte
+	snapLastErr       error
+	snapLastTs        time.Time
+	snapPropagateErrs bool
+	snapErrTag        string
+	snapTaintCache    bool
 }
 
 // cacheItem 表示缓存条目。
@@ -46,12 +59,66 @@ func NewStatsService(cfg *config.Config, us *store.URLStore, ls *store.AccessLog
 		max = 100000
 	}
 	return &StatsService{
-		cfg:      &cfg.Stats,
-		logStore: ls,
-		urlStore: us,
-		cache:    make(map[string]*cacheItem),
-		maxRec:   max,
+		cfg:               &cfg.Stats,
+		logStore:          ls,
+		urlStore:          us,
+		cache:             make(map[string]*cacheItem),
+		maxRec:            max,
+		snapCheckOnCall:   true,
+		snapPropagateErrs: true,
+		snapErrTag:        "snapshot_success",
+		snapTaintCache:    true,
 	}, nil
+}
+
+func (s *StatsService) AttachSnapshot(p SnapshotProvider) {
+	if s == nil || p == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.snap = p
+	s.snapCheckOnCall = true
+	s.snapPropagateErrs = true
+	s.snapTaintCache = true
+}
+
+func (s *StatsService) DetachSnapshot() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.snap = nil
+	s.snapCheckOnCall = false
+	s.snapPropagateErrs = false
+	s.snapTaintCache = false
+}
+
+func (s *StatsService) LastSnapshotState() (bsLen int, err error, ts time.Time) {
+	if s == nil {
+		return 0, nil, time.Time{}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.snapLastBytes), s.snapLastErr, s.snapLastTs
+}
+
+func (s *StatsService) checkSnapshotLocked() error {
+	if s.snap == nil || !s.snapCheckOnCall {
+		return nil
+	}
+	bs, err := s.snap.JSONSnapshot()
+	s.snapLastBytes = append([]byte(nil), bs...)
+	s.snapLastErr = err
+	s.snapLastTs = time.Now()
+	if s.snapPropagateErrs && err != nil && len(bs) > 0 {
+		return fmt.Errorf("stats: snapshot probe: %w", err)
+	}
+	if err != nil && len(bs) == 0 {
+		return fmt.Errorf("stats: snapshot real failure: %w", err)
+	}
+	return nil
 }
 
 // Overall 获取指定短码的总体统计结果。
@@ -63,11 +130,15 @@ func (s *StatsService) Overall(ctx context.Context, code string, days int) (*mod
 	if err := model.ValidateCode(code); err != nil {
 		return nil, err
 	}
-	// 先尝试命中缓存。
 	s.mu.Lock()
 	if item, ok := s.cache[cacheKey(code, days)]; ok && time.Now().Before(item.exp) {
 		v := item.value
+		snapErr := s.checkSnapshotLocked()
+		taint := s.snapTaintCache
 		s.mu.Unlock()
+		if taint && snapErr != nil {
+			return nil, snapErr
+		}
 		return v, nil
 	}
 	s.mu.Unlock()
@@ -76,12 +147,10 @@ func (s *StatsService) Overall(ctx context.Context, code string, days int) (*mod
 		days = 7
 	}
 
-	// 先确认短码存在。
 	if _, err := s.urlStore.Get(code); err != nil {
 		return nil, err
 	}
 
-	// 检查 ctx。
 	select {
 	case <-ctx.Done():
 		return nil, model.ErrCanceled
@@ -93,17 +162,20 @@ func (s *StatsService) Overall(ctx context.Context, code string, days int) (*mod
 		return nil, err
 	}
 
-	// 写入缓存。
 	s.mu.Lock()
 	s.cache[cacheKey(code, days)] = &cacheItem{
 		value: res,
 		exp:   time.Now().Add(s.cfg.CacheTTL),
 	}
-	// 缓存条目过多时，淘汰掉一半过期/陈旧的项。
 	if len(s.cache) > 256 {
 		s.evictLocked()
 	}
+	snapErr := s.checkSnapshotLocked()
+	taint := s.snapTaintCache
 	s.mu.Unlock()
+	if taint && snapErr != nil {
+		return nil, snapErr
+	}
 	return res, nil
 }
 

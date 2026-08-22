@@ -145,6 +145,8 @@ func main() {
 	adminSvc.RegisterSyncer("access_log", logStore)
 	adminSvc.RegisterCloser("url_store", urlStore)
 	adminSvc.RegisterCloser("access_log", logStore)
+	adminSvc.BindSnapshot(metricsSvc)
+	stSvc.AttachSnapshot(metricsSvc)
 	adminSvc.SetMeta("version", Version)
 	adminSvc.SetMeta("commit", CommitID)
 	adminSvc.SetMeta("resolver_stats", func() any { return rsv.Stats() })

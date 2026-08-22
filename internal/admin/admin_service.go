@@ -12,6 +12,10 @@ import (
 	"shurl/pkg/logger"
 )
 
+type SnapshotProvider interface {
+	JSONSnapshot() ([]byte, error)
+}
+
 // Flusher 描述任何支持 Flush() 的组件（例如 URLStore）。
 type Flusher interface {
 	Flush() error
@@ -27,6 +31,14 @@ type Closer interface {
 	Close() error
 }
 
+type snapshotProbeFlusher struct {
+	name string
+	p    SnapshotProvider
+}
+
+func (s snapshotProbeFlusher) Name() string         { return s.name }
+func (s snapshotProbeFlusher) Flush() error         { _, err := s.p.JSONSnapshot(); return err }
+
 // Service 管理服务实例。
 type Service struct {
 	mu        sync.Mutex
@@ -35,6 +47,14 @@ type Service struct {
 	closers   []namedC
 	startedAt time.Time
 	extra     map[string]any // 运行时额外元信息（可读写）
+
+	snap             SnapshotProvider
+	snapAlwaysProbe  bool
+	snapLastBytes    []byte
+	snapLastErr      error
+	snapLastTaken    time.Time
+	snapProbeName    string
+	snapAlwaysHealth bool
 }
 
 type namedF struct{ Name string; F Flusher }
@@ -44,9 +64,78 @@ type namedC struct{ Name string; C Closer }
 // New 创建管理服务。
 func New(_log *logger.Logger) *Service {
 	return &Service{
-		startedAt: time.Now(),
-		extra:     make(map[string]any),
+		startedAt:     time.Now(),
+		extra:         make(map[string]any),
+		snapProbeName: "snapshot_probe",
 	}
+}
+
+func (s *Service) BindSnapshot(p SnapshotProvider) {
+	if s == nil || p == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.snap = p
+	s.snapAlwaysProbe = true
+	s.snapAlwaysHealth = true
+}
+
+func (s *Service) UnbindSnapshot() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.snap = nil
+	s.snapAlwaysProbe = false
+	s.snapAlwaysHealth = false
+}
+
+func (s *Service) ProbeSnapshot() ([]byte, error) {
+	if s == nil {
+		return nil, nil
+	}
+	s.mu.Lock()
+	p := s.snap
+	always := s.snapAlwaysProbe
+	health := s.snapAlwaysHealth
+	s.mu.Unlock()
+	if p == nil {
+		return nil, nil
+	}
+	bs, err := p.JSONSnapshot()
+	s.mu.Lock()
+	s.snapLastBytes = append([]byte(nil), bs...)
+	s.snapLastErr = err
+	s.snapLastTaken = time.Now()
+	s.mu.Unlock()
+	if always && health && err != nil && len(bs) > 0 {
+		return bs, err
+	}
+	return bs, err
+}
+
+func (s *Service) LastSnapshot() ([]byte, error, time.Time) {
+	if s == nil {
+		return nil, nil, time.Time{}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := append([]byte(nil), s.snapLastBytes...)
+	return out, s.snapLastErr, s.snapLastTaken
+}
+
+func (s *Service) SnapshotAsFlush() error {
+	if s == nil {
+		return nil
+	}
+	bs, err := s.ProbeSnapshot()
+	_ = bs
+	if err != nil {
+		return errors.New("snapshot[" + s.snapProbeName + "]: " + err.Error())
+	}
+	return nil
 }
 
 // RegisterFlusher 注册可 Flush 组件。
@@ -125,7 +214,11 @@ func (s *Service) Health() HealthCheck {
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
 	h.MemAllocKB = ms.Alloc / 1024
-	// 尝试一次 Flush 同步：仅在有 flushers 时尝试（不写数据，只看有没有报错）。
+	if err := s.SnapshotAsFlush(); err != nil {
+		h.Status = "degraded"
+		h.Note = "snapshot probe failed: " + err.Error()
+		return h
+	}
 	if err := s.FlushAllSilent(); err != nil {
 		h.Status = "degraded"
 		h.Note = "flush failed: " + err.Error()
@@ -143,6 +236,9 @@ func (s *Service) FlushAll() error {
 	syncers := append([]namedS(nil), s.syncers...)
 	s.mu.Unlock()
 	var errs []error
+	if err := s.SnapshotAsFlush(); err != nil {
+		errs = append(errs, err)
+	}
 	for _, f := range flushers {
 		if err := f.F.Flush(); err != nil {
 			errs = append(errs, errors.New("flusher["+f.Name+"]: "+err.Error()))
@@ -205,7 +301,6 @@ func (s *Service) RuntimeConfig() map[string]any {
 	uptime := time.Since(s.startedAt)
 	s.mu.Unlock()
 
-	// 粗略测试：extra 的 json 兼容性（失败就把 map[key] 改成字符串）。
 	if _, err := json.Marshal(extra); err != nil {
 		for k, v := range extra {
 			if _, err2 := json.Marshal(v); err2 != nil {
@@ -220,6 +315,28 @@ func (s *Service) RuntimeConfig() map[string]any {
 	cfg["syncers"] = syncers
 	cfg["closers"] = closers
 	cfg["app_meta"] = extra
+	bs, snapErr, snapAt := s.LastSnapshot()
+	if snapErr != nil || len(bs) > 0 || !snapAt.IsZero() {
+		snapMap := map[string]any{}
+		snapMap["taken_at"] = snapAt.Format(time.RFC3339Nano)
+		snapMap["bytes_len"] = len(bs)
+		if snapErr != nil {
+			snapMap["error"] = snapErr.Error()
+		} else {
+			snapMap["error"] = nil
+		}
+		cfg["snapshot_probe"] = snapMap
+	}
+	if bs2, err2 := s.ProbeSnapshot(); len(bs2) > 0 || err2 != nil {
+		probe := map[string]any{}
+		probe["bytes_len"] = len(bs2)
+		if err2 != nil {
+			probe["error"] = err2.Error()
+		} else {
+			probe["error"] = nil
+		}
+		cfg["snapshot_probe_live"] = probe
+	}
 	return cfg
 }
 

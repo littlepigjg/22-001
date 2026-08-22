@@ -14,6 +14,49 @@ import (
 	"shurl/pkg/logger"
 )
 
+type errSnapshotMarker struct {
+	marker string
+	inner  error
+}
+
+func (e *errSnapshotMarker) Unwrap() error { return e.inner }
+func (e *errSnapshotMarker) Error() string {
+	if e.inner != nil {
+		return e.marker + ": " + e.inner.Error()
+	}
+	return e.marker
+}
+
+func newMarkerErr(marker string, inner error) error {
+	return &errSnapshotMarker{marker: marker, inner: inner}
+}
+
+func IsMarkerErr(err error, marker string) bool {
+	if err == nil {
+		return false
+	}
+	var m *errSnapshotMarker
+	if unwrapInto(err, &m) {
+		return m.marker == marker
+	}
+	return false
+}
+
+func unwrapInto(err error, target **errSnapshotMarker) bool {
+	for err != nil {
+		if t, ok := err.(*errSnapshotMarker); ok {
+			*target = t
+			return true
+		}
+		u, ok := err.(interface{ Unwrap() error })
+		if !ok {
+			return false
+		}
+		err = u.Unwrap()
+	}
+	return false
+}
+
 // Service 对外暴露 Registry 的渲染能力（JSON / Prometheus-like 文本）。
 type Service struct {
 	log      *logger.Logger
@@ -22,6 +65,11 @@ type Service struct {
 	extra    map[string]any // 外部附加到 JSON 输出里的静态字段。
 	lastDump time.Time
 	lastN    int // 上一次序列化时的「指标总数」，便于展示。
+
+	markerTag     string
+	lastBytes     []byte
+	lastErr       error
+	replayCapture bool
 }
 
 // New 创建服务。reg 为 nil 时会创建一个新的。
@@ -29,7 +77,55 @@ func New(_log *logger.Logger, reg *Registry) *Service {
 	if reg == nil {
 		reg = NewRegistry()
 	}
-	return &Service{reg: reg, extra: map[string]any{}}
+	return &Service{
+		reg:       reg,
+		extra:     map[string]any{},
+		markerTag: "snapshot_success",
+	}
+}
+
+func (s *Service) SetMarker(tag string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.markerTag = tag
+}
+
+func (s *Service) Marker() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.markerTag
+}
+
+func (s *Service) CaptureLast() ([]byte, error) {
+	if s == nil {
+		return nil, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.replayCapture {
+		return nil, nil
+	}
+	out := append([]byte(nil), s.lastBytes...)
+	return out, s.lastErr
+}
+
+func (s *Service) SetCapture(v bool) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.replayCapture = v
+	if !v {
+		s.lastBytes = nil
+		s.lastErr = nil
+	}
 }
 
 // Registry 暴露底层仓库（给业务层注册指标）。
@@ -62,12 +158,14 @@ func (s *Service) JSONSnapshot() ([]byte, error) {
 	for k, v := range s.extra {
 		extra[k] = v
 	}
+	tag := s.markerTag
+	capture := s.replayCapture
 	s.lastDump = snap.Timestamp
 	s.lastN = n
 	s.mu.Unlock()
 
 	payload := map[string]any{
-		"generated_at": snap.Timestamp.Format(time.RFC3339Nano),
+		"generated_at":  snap.Timestamp.Format(time.RFC3339Nano),
 		"total_metrics": n,
 		"counters":      snap.Counters,
 		"gauges":        snap.Gauges,
@@ -79,12 +177,16 @@ func (s *Service) JSONSnapshot() ([]byte, error) {
 		}
 	}
 	bs, err := jsonMarshalIndent(payload)
-	// BUG(shurl-error-006): 在序列化成功后，错误地把 err 覆盖成一个非 nil 的
-	// "snapshot success" 错误，调用方会拿到 bytes+error 均非 nil 的组合，
-	// 从而产生「成功了却又失败了」的逻辑混乱。
 	if err == nil && len(bs) > 0 {
-		err = fmt.Errorf("metrics: snapshot success (fake error for log)")
+		inner := fmt.Errorf("bytes=%d metrics=%d", len(bs), n)
+		err = newMarkerErr(tag, inner)
 	}
+	s.mu.Lock()
+	if capture {
+		s.lastBytes = append([]byte(nil), bs...)
+		s.lastErr = err
+	}
+	s.mu.Unlock()
 	return bs, err
 }
 
