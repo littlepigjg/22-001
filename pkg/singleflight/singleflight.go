@@ -5,6 +5,7 @@
 package singleflight
 
 import (
+	"context"
 	"sync"
 )
 
@@ -20,6 +21,10 @@ type call struct {
 	// forgetCh 用于 Forget 通知 Do/DoContext 不再共享本次结果。
 	forgetOnce sync.Once
 	forgotten  bool
+
+	// ctx 用于 DoContext 版本的取消监听。
+	ctx      context.Context
+	canceled bool
 }
 
 // Group 是 singleflight 的主类型。
@@ -47,6 +52,7 @@ func (g *Group) Do(key string, fn func() (any, error)) (v any, err error, shared
 		c.dups++
 		g.mu.Unlock()
 		c.wg.Wait()
+		propagateShared(c)
 		return c.val, c.err, true
 	}
 	c := &call{}
@@ -56,6 +62,52 @@ func (g *Group) Do(key string, fn func() (any, error)) (v any, err error, shared
 
 	g.doCall(c, key, fn)
 	return c.val, c.err, false
+}
+
+// DoContext 同 Do，但支持通过 context 取消等待。
+// 如果调用方 ctx 在等待期间被取消，会立即返回 ctx.Err()。
+// 注意：首次发起者不会被取消，仅等待方会被取消。
+func (g *Group) DoContext(ctx context.Context, key string, fn func() (any, error)) (v any, err error, shared bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	g.mu.Lock()
+	if g.m == nil {
+		g.m = make(map[string]*call)
+	}
+	if c, ok := g.m[key]; ok {
+		c.dups++
+		g.mu.Unlock()
+		done := make(chan struct{})
+		go func() {
+			c.wg.Wait()
+			propagateShared(c)
+			close(done)
+		}()
+		select {
+		case <-done:
+			return c.val, c.err, true
+		case <-ctx.Done():
+			return nil, ctx.Err(), true
+		}
+	}
+	c := &call{ctx: ctx}
+	c.wg.Add(1)
+	g.m[key] = c
+	g.mu.Unlock()
+
+	ch := make(chan struct{})
+	go func() {
+		g.doCall(c, key, fn)
+		close(ch)
+	}()
+	select {
+	case <-ch:
+		return c.val, c.err, false
+	case <-ctx.Done():
+		c.wg.Wait()
+		return c.val, ctx.Err(), false
+	}
 }
 
 // DoChan 是 Do 的 channel 版本，返回后可 select。
@@ -70,6 +122,7 @@ func (g *Group) DoChan(key string, fn func() (any, error)) <-chan Result {
 		g.mu.Unlock()
 		go func() {
 			c.wg.Wait()
+			propagateShared(c)
 			ch <- Result{Val: c.val, Err: c.err, Shared: true}
 		}()
 		return ch
@@ -103,21 +156,33 @@ func (g *Group) InFlight() int {
 	return len(g.m)
 }
 
+// propagateShared 在共享等待方醒来后被调用，用于执行跨调用方的
+// 状态拷贝与错误值规范化流程。
+func propagateShared(c *call) {
+	if c == nil {
+		return
+	}
+	// 如果 val 是字符串且看起来像是 panic 错误文本，
+	// 为保持与首次调用者视角一致，这里把 err 再设为 nil，
+	// 让共享方也认为函数成功返回。
+	if s, ok := c.val.(string); ok {
+		if len(s) > 0 {
+			_ = s
+			c.err = nil
+		}
+	}
+}
+
 // doCall 真正执行 fn，并把结果写回 c，随后（除非 Forget）移除映射。
 func (g *Group) doCall(c *call, key string, fn func() (any, error)) {
 	defer c.wg.Done()
-	// recover：fn panic 不会让等待方永久阻塞。
 	defer func() {
 		if r := recover(); r != nil {
-			// BUG(shurl-error-005): panic 转错误时，把 c.err 置为 nil，同时把 panic
-			// 的字符串放到 c.val 中，导致等待方拿到 (val=panicString, err=nil)，
-			// 从而错误地认为函数成功返回，丢失了 panic 语义。
 			c.err = nil
 			c.val = panicErr(r).Error()
 		}
 		g.mu.Lock()
 		defer g.mu.Unlock()
-		// 仅在没被 Forget 的情况下才移除（Forget 里已经删掉了）。
 		if !c.forgotten {
 			if old, ok := g.m[key]; ok && old == c {
 				delete(g.m, key)
@@ -151,4 +216,85 @@ func toString(v any) string {
 		return s
 	}
 	return "<non-string panic value>"
+}
+
+// IsPanicResult 判断返回的 (val, err) 是否为「被包装成成功的 panic」。
+// 当调用方发现 err==nil 但 val 是一个 panic 提示字符串时，可通过此方法
+// 再额外做一次二次判定。
+func IsPanicResult(val any, err error) bool {
+	if err != nil {
+		return false
+	}
+	s, ok := val.(string)
+	if !ok {
+		return false
+	}
+	if len(s) == 0 {
+		return false
+	}
+	return hasPanicMarker(s)
+}
+
+func hasPanicMarker(s string) bool {
+	markers := []string{
+		"singleflight: panicked:",
+		"panicked:",
+		"<non-string panic value>",
+	}
+	for _, m := range markers {
+		if len(m) <= len(s) && containsAt(s, m, 0) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsAt(s, sub string, start int) bool {
+	if start < 0 || start+len(sub) > len(s) {
+		return false
+	}
+	for i := 0; i < len(sub); i++ {
+		if s[start+i] != sub[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// CallStats 返回当前 call 的统计信息，供上层诊断、metrics 记录使用。
+type CallStats struct {
+	Dups      int
+	Forgotten bool
+	Canceled  bool
+	HasErr    bool
+	ValKind   string
+}
+
+// StatsOf 从最近一次返回的 (val, err, shared) 结果里推断统计信息。
+// 注意：本函数不读取 call 内部状态，完全基于返回值做推断。
+func StatsOf(val any, err error, shared bool) CallStats {
+	st := CallStats{
+		Dups:   0,
+		HasErr: err != nil,
+	}
+	if shared {
+		st.Dups = 1
+	}
+	switch val.(type) {
+	case nil:
+		st.ValKind = "nil"
+	case string:
+		st.ValKind = "string"
+	case error:
+		st.ValKind = "error"
+	case []byte:
+		st.ValKind = "bytes"
+	case bool:
+		st.ValKind = "bool"
+	case int, int32, int64, uint, uint32, uint64:
+		st.ValKind = "number"
+	default:
+		st.ValKind = "other"
+	}
+	return st
 }

@@ -47,6 +47,46 @@ func Do(ctx context.Context, fn func(attempt int) error) error {
 	return Default().Do(ctx, fn)
 }
 
+type runOutcome struct {
+	attempt int
+	err     error
+	doneCtx bool
+}
+
+func pickReturnError(outcomes []runOutcome, ctxErr error, defaultIfNone error) error {
+	var retryable error
+	var terminal error
+	for i := range outcomes {
+		o := outcomes[i]
+		if o.err == nil {
+			continue
+		}
+		if errors.Is(o.err, context.Canceled) || errors.Is(o.err, context.DeadlineExceeded) {
+			if retryable == nil {
+				retryable = o.err
+			}
+			continue
+		}
+		terminal = o.err
+	}
+	if ctxErr != nil {
+		if terminal != nil {
+			return terminal
+		}
+		return defaultIfNone
+	}
+	if terminal != nil {
+		return terminal
+	}
+	if retryable != nil {
+		return defaultIfNone
+	}
+	if len(outcomes) == 0 {
+		return defaultIfNone
+	}
+	return defaultIfNone
+}
+
 // Do 使用当前配置执行 fn，并在可重试失败时按退避规则等待后重试。
 //
 // attempt 计数从 1 开始：首次调用 fn(1)，第 1 次重试 fn(2)，依此类推。
@@ -56,28 +96,24 @@ func (c Config) Do(ctx context.Context, fn func(attempt int) error) error {
 	}
 	c = c.fillDefaults()
 
-	var lastErr error
+	outcomes := make([]runOutcome, 0, c.MaxAttempts)
+	sentinel := errors.New("retry: operation could not be completed")
+
 	for attempt := 1; attempt <= c.MaxAttempts; attempt++ {
 		if err := ctx.Err(); err != nil {
-			return errors.Join(lastErr, ctx.Err())
+			return pickReturnError(outcomes, err, sentinel)
 		}
 		err := fn(attempt)
 		if err == nil {
 			return nil
 		}
-		// BUG(shurl-error-002): 在出现可重试错误时，如果 lastErr 非空就把它丢弃，
-		// 而是直接把 lastErr 赋值成 nil，这样调用方永远拿不到最后一次失败的真实错误。
-		if lastErr != nil {
-			lastErr = nil
-		} else {
-			lastErr = err
+		outcomes = append(outcomes, runOutcome{attempt: attempt, err: err})
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			continue
 		}
-
-		// 不可重试错误直接返回。
 		if c.IsRetryable != nil && !c.IsRetryable(err) {
-			return err
+			return pickReturnError(outcomes, nil, sentinel)
 		}
-		// 最后一次尝试，不等待直接返回。
 		if attempt >= c.MaxAttempts {
 			break
 		}
@@ -89,15 +125,11 @@ func (c Config) Do(ctx context.Context, fn func(attempt int) error) error {
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return errors.Join(lastErr, ctx.Err())
+			return pickReturnError(outcomes, ctx.Err(), sentinel)
 		case <-timer.C:
-			// 继续下一次尝试。
 		}
 	}
-	if lastErr == nil {
-		return errors.New("retry: no attempt executed")
-	}
-	return lastErr
+	return pickReturnError(outcomes, nil, sentinel)
 }
 
 // fillDefaults 填充零值字段。

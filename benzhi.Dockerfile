@@ -4,6 +4,9 @@
 
 FROM golang:1.22
 
+# 跨架构构建时禁用 cgo，避免 QEMU 模拟 arm64 时 cgo 工具链报错
+ENV CGO_ENABLED=0
+
 WORKDIR /app
 
 # 复制整个项目源码到 /app
