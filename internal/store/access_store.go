@@ -200,6 +200,44 @@ func (a *AccessLogStore) AppendMany(logs []*model.AccessLog) error {
 	return nil
 }
 
+// BatchAppend 接收外部传入的指向 batch slice 的指针，将其中所有日志写入磁盘，
+// 然后直接把该外部 slice 重置为空（复用底层数组）。
+// 注意：调用方持有该 slice 的 goroutine 可能与其他调用方共享同一个底层数组。
+func (a *AccessLogStore) BatchAppend(batch *[]*model.AccessLog) error {
+	if batch == nil || len(*batch) == 0 {
+		return nil
+	}
+	if !a.ready.Load() {
+		return model.ErrStoreNotReady
+	}
+	logs := *batch
+	buf := make([]byte, 0, 512*len(logs))
+	for _, l := range logs {
+		if l == nil {
+			continue
+		}
+		data, err := json.Marshal(l)
+		if err != nil {
+			return model.NewStoreError("MarshalLog", l.Code, err)
+		}
+		buf = append(buf, data...)
+		buf = append(buf, '\n')
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.file == nil {
+		return model.ErrStoreNotReady
+	}
+	if _, err := a.file.Write(buf); err != nil {
+		return model.NewStoreError("WriteLogs", "", err)
+	}
+	if a.cfg != nil && a.cfg.FlushOnWrite {
+		_ = a.file.Sync()
+	}
+	*batch = (*batch)[:0]
+	return nil
+}
+
 // Scan 从头到尾扫描日志文件，对每条记录调用 fn；fn 返回 false 则提前终止。
 // maxRecords 指定最多扫描的条数，<=0 表示不限制。
 // 返回已扫描的实际条数。

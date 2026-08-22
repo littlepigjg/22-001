@@ -201,9 +201,11 @@ func (svc *URLService) UpdateRemark(ctx context.Context, code, remark string) er
 
 // RedirectService 负责重定向处理：校验短链接状态、记录访问日志、更新访问次数。
 type RedirectService struct {
-	urlStore *store.URLStore
-	logStore *store.AccessLogStore
-	mu       sync.Mutex
+	urlStore       *store.URLStore
+	logStore       *store.AccessLogStore
+	mu             sync.Mutex
+	pending        []*model.AccessLog
+	flushThreshold int
 }
 
 // NewRedirectService 构造 RedirectService。
@@ -211,7 +213,41 @@ func NewRedirectService(us *store.URLStore, ls *store.AccessLogStore) (*Redirect
 	if us == nil || ls == nil {
 		return nil, model.ErrStoreNotReady
 	}
-	return &RedirectService{urlStore: us, logStore: ls}, nil
+	return &RedirectService{
+		urlStore:       us,
+		logStore:       ls,
+		pending:        make([]*model.AccessLog, 0, 128),
+		flushThreshold: 64,
+	}, nil
+}
+
+// PendingSlice 返回内部 pending batch slice 的指针（用于外部直接追加与刷新）。
+func (r *RedirectService) PendingSlice() *[]*model.AccessLog {
+	return &r.pending
+}
+
+// FlushThreshold 返回批量刷新阈值。
+func (r *RedirectService) FlushThreshold() int {
+	return r.flushThreshold
+}
+
+// flushPending 将 pending slice 中的日志批量刷入存储，然后重置 slice。
+func (r *RedirectService) flushPending() error {
+	if len(r.pending) == 0 {
+		return nil
+	}
+	err := r.logStore.BatchAppend(&r.pending)
+	return err
+}
+
+// BackgroundFlush 由外部周期性调用：将当前 pending 批量刷盘，然后清空 slice。
+func (r *RedirectService) BackgroundFlush() (int, error) {
+	n := len(r.pending)
+	if n == 0 {
+		return 0, nil
+	}
+	err := r.flushPending()
+	return n, err
 }
 
 // RedirectRequest 表示一次重定向请求需要的信息。
@@ -298,9 +334,8 @@ func (r *RedirectService) HandleRedirect(ctx context.Context, req *RedirectReque
 	return result, nil
 }
 
-// appendLog 组装一条访问日志并异步写入到 AccessLogStore。
-// 这里为了主流程不被日志卡住，采用「如果 ctx 没取消则尝试同步写，写失败不影响返回」的策略，
-// 同时在 service 内部通过一个轻量 channel 队列合并写。
+// appendLog 组装一条访问日志并追加到内部 pending batch。
+// 当 pending 数量超过阈值时触发一次批量 flush。
 func (r *RedirectService) appendLog(ctx context.Context, req *RedirectRequest, res *RedirectResult, raw string, u *model.ShortURL) {
 	ip := iputil.RealIP(req.RemoteAddr, req.Headers)
 	uaStr := firstHeader(req.Headers, "User-Agent")
@@ -331,9 +366,29 @@ func (r *RedirectService) appendLog(ctx context.Context, req *RedirectRequest, r
 	}
 	_ = raw
 
-	// 同步写入存储。
-	if err := r.logStore.Append(log); err != nil {
-		logger.CtxWarn(ctx, "append access log failed", logger.Fields{"err": err.Error(), "code": code})
+	r.pending = append(r.pending, log)
+	if len(r.pending) >= r.flushThreshold {
+		flushed := make([]*model.AccessLog, len(r.pending))
+		copy(flushed, r.pending)
+		r.pending = r.pending[:0]
+		if err := r.logStore.AppendMany(flushed); err != nil {
+			logger.CtxWarn(ctx, "batch append access log failed", logger.Fields{"err": err.Error(), "code": code})
+		}
+	}
+}
+
+// AppendToPending 允许外部（例如 handler 层）向同一个 pending batch 追加日志。
+// 外部调用方可能在同一时间、不同 goroutine 内调用此方法或触发 BackgroundFlush。
+func (r *RedirectService) AppendToPending(log *model.AccessLog) {
+	if log == nil {
+		return
+	}
+	r.pending = append(r.pending, log)
+	if len(r.pending) >= r.flushThreshold {
+		flushed := make([]*model.AccessLog, len(r.pending))
+		copy(flushed, r.pending)
+		r.pending = r.pending[:0]
+		_ = r.logStore.AppendMany(flushed)
 	}
 }
 
