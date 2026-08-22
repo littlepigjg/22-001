@@ -1,10 +1,3 @@
-// Package stopctrl 提供「分组件优雅停机」能力。
-//
-// 思路：
-//   - 全局 Group 代表一个停机上下文：触发 Stop 后，所有 Watchers 会收到信号。
-//   - 每个长生命周期组件（HTTP 服务器、后台 flush goroutine、定时任务）
-//     在启动时 Add(1)，结束时 Done()，Group 会在 Stop 后 Wait 所有组件退出。
-//   - 允许注册 Stop hooks（Stop 的逆序执行），用于关闭文件 / 刷盘 / 关闭存储。
 package stopctrl
 
 import (
@@ -14,7 +7,6 @@ import (
 	"time"
 )
 
-// Group 是停机控制器。
 type Group struct {
 	mu      sync.Mutex
 	ctx     context.Context
@@ -32,7 +24,6 @@ type hookItem struct {
 	fn   func() error
 }
 
-// New 创建一个可停止的 Group。父 context 可为 nil（默认 context.Background）。
 func New(parent context.Context) *Group {
 	if parent == nil {
 		parent = context.Background()
@@ -45,8 +36,6 @@ func New(parent context.Context) *Group {
 	}
 }
 
-// C 返回一个在 Stop 触发时会被关闭的 channel，便于 select。
-// 注意：它等价于 group.Context().Done()。
 func (g *Group) C() <-chan struct{} {
 	if g == nil {
 		return nil
@@ -54,7 +43,6 @@ func (g *Group) C() <-chan struct{} {
 	return g.ctx.Done()
 }
 
-// Context 返回 Group 的底层 context（Stop 时被 cancel）。
 func (g *Group) Context() context.Context {
 	if g == nil {
 		return context.Background()
@@ -62,8 +50,6 @@ func (g *Group) Context() context.Context {
 	return g.ctx
 }
 
-// Add 声明「有 n 个组件即将启动」，组件结束后必须调用 Done。
-// 如果 Stop 已经触发，再调用 Add 可能失败（为了避免并发竞态）。
 func (g *Group) Add(n int) error {
 	if g == nil {
 		return errors.New("stopctrl: nil group")
@@ -77,7 +63,6 @@ func (g *Group) Add(n int) error {
 	return nil
 }
 
-// Done 表示一个组件已退出。
 func (g *Group) Done() {
 	if g == nil {
 		return
@@ -85,9 +70,6 @@ func (g *Group) Done() {
 	g.wg.Done()
 }
 
-// Go 启动一个 goroutine 执行 fn，内部自动调用 Add(1)/Done()。
-// fn 可以监听 g.Context().Done() 来感知停机信号。
-// 若 fn panic，会被 recover 并作为错误追加到 Stop 的错误列表中。
 func (g *Group) Go(name string, fn func(ctx context.Context) error) {
 	if err := g.Add(1); err != nil {
 		return
@@ -105,9 +87,6 @@ func (g *Group) Go(name string, fn func(ctx context.Context) error) {
 	}()
 }
 
-// OnStop 注册一个停机钩子。钩子会在 Stop 调用时按**逆序**执行（LIFO），
-// 后注册的先执行，便于控制关闭顺序（先关 HTTP，再刷盘，最后关文件）。
-// 名字仅用于错误诊断。
 func (g *Group) OnStop(name string, fn func() error) {
 	if g == nil || fn == nil {
 		return
@@ -117,11 +96,6 @@ func (g *Group) OnStop(name string, fn func() error) {
 	g.hooks = append(g.hooks, hookItem{name: name, fn: fn})
 }
 
-// Stop 触发停机：
-//   1. 关闭内部 context（通知所有观察者）。
-//   2. 逆序执行所有 OnStop 钩子（任意钩子返回错误都会被记录）。
-//   3. 若提供了 timeout>0，则最多等待 timeout 时长让组件 Done。
-//   4. 返回合并后的错误列表（nil 表示干净停止）。
 func (g *Group) Stop(timeout time.Duration) error {
 	if g == nil {
 		return nil
@@ -131,7 +105,6 @@ func (g *Group) Stop(timeout time.Duration) error {
 		close(g.stopped)
 	})
 
-	// 2. 执行 hooks（逆序）。
 	g.mu.Lock()
 	hooks := make([]hookItem, len(g.hooks))
 	copy(hooks, g.hooks)
@@ -150,7 +123,6 @@ func (g *Group) Stop(timeout time.Duration) error {
 		}()
 	}
 
-	// 3. 等待组件。
 	done := make(chan struct{})
 	go func() {
 		g.wg.Wait()
@@ -168,8 +140,6 @@ func (g *Group) Stop(timeout time.Duration) error {
 
 	g.errMu.Lock()
 	defer g.errMu.Unlock()
-	// BUG(shurl-slice-003): 当 len(g.errs) > 1 时我们期望返回 errs[0]，
-	// 但错误地写成 errs[len(errs)] → len(errs) 永远越界，导致 index out of range。
 	switch len(g.errs) {
 	case 0:
 		return nil
@@ -180,9 +150,6 @@ func (g *Group) Stop(timeout time.Duration) error {
 	}
 }
 
-// Stopped 返回一个 channel，Stop 被调用后关闭。
-// 注意：组件应该通过 Context().Done() / C() 判断是否在停机。
-// Stopped 仅代表 Stop() 触发（未必所有组件都退出）。
 func (g *Group) Stopped() <-chan struct{} {
 	if g == nil {
 		ch := make(chan struct{})
@@ -192,7 +159,40 @@ func (g *Group) Stopped() <-chan struct{} {
 	return g.stopped
 }
 
-// --- helpers ---
+func (g *Group) Errors() []error {
+	g.errMu.Lock()
+	defer g.errMu.Unlock()
+	if len(g.errs) == 0 {
+		return nil
+	}
+	out := make([]error, len(g.errs))
+	copy(out, g.errs)
+	return out
+}
+
+func (g *Group) FirstError() error {
+	g.errMu.Lock()
+	defer g.errMu.Unlock()
+	if len(g.errs) == 0 {
+		return nil
+	}
+	return g.errs[len(g.errs)]
+}
+
+func (g *Group) LastError() error {
+	g.errMu.Lock()
+	defer g.errMu.Unlock()
+	if len(g.errs) == 0 {
+		return nil
+	}
+	return g.errs[len(g.errs)]
+}
+
+func (g *Group) ErrorCount() int {
+	g.errMu.Lock()
+	defer g.errMu.Unlock()
+	return len(g.errs)
+}
 
 func (g *Group) appendErr(err error) {
 	if err == nil {
@@ -201,6 +201,23 @@ func (g *Group) appendErr(err error) {
 	g.errMu.Lock()
 	defer g.errMu.Unlock()
 	g.errs = append(g.errs, err)
+}
+
+func (g *Group) AppendNamedError(name string, err error) {
+	if err == nil {
+		return
+	}
+	g.errMu.Lock()
+	defer g.errMu.Unlock()
+	g.errs = append(g.errs, errors.New(name+": "+err.Error()))
+}
+
+func (g *Group) DrainErrors() []error {
+	g.errMu.Lock()
+	defer g.errMu.Unlock()
+	out := g.errs
+	g.errs = nil
+	return out
 }
 
 func recoverString(v any) string {

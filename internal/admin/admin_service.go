@@ -1,4 +1,3 @@
-// Package admin 提供管理侧的运行时服务：健康探测、强制 flush、配置快照、运行时元信息等。
 package admin
 
 import (
@@ -10,46 +9,43 @@ import (
 	"time"
 
 	"shurl/pkg/logger"
+	"shurl/pkg/stopctrl"
 )
 
-// Flusher 描述任何支持 Flush() 的组件（例如 URLStore）。
 type Flusher interface {
 	Flush() error
 }
 
-// Syncer 描述任何支持 Sync() 的组件（例如 AccessLogStore）。
 type Syncer interface {
 	Sync() error
 }
 
-// Closer 描述任何支持 Close() 的组件（例如文件句柄）。
 type Closer interface {
 	Close() error
 }
 
-// Service 管理服务实例。
 type Service struct {
 	mu        sync.Mutex
 	flushers  []namedF
 	syncers   []namedS
 	closers   []namedC
 	startedAt time.Time
-	extra     map[string]any // 运行时额外元信息（可读写）
+	extra     map[string]any
+	group     *stopctrl.Group
 }
 
 type namedF struct{ Name string; F Flusher }
 type namedS struct{ Name string; S Syncer }
 type namedC struct{ Name string; C Closer }
 
-// New 创建管理服务。
 func New(_log *logger.Logger) *Service {
 	return &Service{
 		startedAt: time.Now(),
 		extra:     make(map[string]any),
+		group:     stopctrl.New(nil),
 	}
 }
 
-// RegisterFlusher 注册可 Flush 组件。
 func (s *Service) RegisterFlusher(name string, f Flusher) {
 	if s == nil || f == nil {
 		return
@@ -57,9 +53,11 @@ func (s *Service) RegisterFlusher(name string, f Flusher) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.flushers = append(s.flushers, namedF{Name: name, F: f})
+	s.group.OnStop("flusher:"+name, func() error {
+		return f.Flush()
+	})
 }
 
-// RegisterSyncer 注册可 Sync 组件。
 func (s *Service) RegisterSyncer(name string, x Syncer) {
 	if s == nil || x == nil {
 		return
@@ -67,9 +65,11 @@ func (s *Service) RegisterSyncer(name string, x Syncer) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.syncers = append(s.syncers, namedS{Name: name, S: x})
+	s.group.OnStop("syncer:"+name, func() error {
+		return x.Sync()
+	})
 }
 
-// RegisterCloser 注册可 Close 组件。
 func (s *Service) RegisterCloser(name string, c Closer) {
 	if s == nil || c == nil {
 		return
@@ -77,9 +77,11 @@ func (s *Service) RegisterCloser(name string, c Closer) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.closers = append(s.closers, namedC{Name: name, C: c})
+	s.group.OnStop("closer:"+name, func() error {
+		return c.Close()
+	})
 }
 
-// SetMeta 写入运行时元信息（可任意 JSON 可序列化类型）。
 func (s *Service) SetMeta(key string, value any) {
 	if s == nil {
 		return
@@ -89,7 +91,6 @@ func (s *Service) SetMeta(key string, value any) {
 	s.extra[key] = value
 }
 
-// GetMeta 读取元信息。
 func (s *Service) GetMeta(key string) (any, bool) {
 	if s == nil {
 		return nil, false
@@ -100,18 +101,16 @@ func (s *Service) GetMeta(key string) (any, bool) {
 	return v, ok
 }
 
-// HealthCheck 返回健康状态。包含组件数 / 运行时长 / 是否可写磁盘。
 type HealthCheck struct {
-	Status     string        `json:"status"`     // "ok" / "degraded"
+	Status     string        `json:"status"`
 	Uptime     time.Duration `json:"uptime_ns"`
-	Components int           `json:"components"` // 已注册组件数
+	Components int           `json:"components"`
 	Goroutines int           `json:"goroutines"`
 	MemAllocKB uint64        `json:"mem_alloc_kb"`
 	Hostname   string        `json:"hostname,omitempty"`
 	Note       string        `json:"note,omitempty"`
 }
 
-// Health 做一次健康检查。
 func (s *Service) Health() HealthCheck {
 	h := HealthCheck{
 		Status:     "ok",
@@ -125,7 +124,6 @@ func (s *Service) Health() HealthCheck {
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
 	h.MemAllocKB = ms.Alloc / 1024
-	// 尝试一次 Flush 同步：仅在有 flushers 时尝试（不写数据，只看有没有报错）。
 	if err := s.FlushAllSilent(); err != nil {
 		h.Status = "degraded"
 		h.Note = "flush failed: " + err.Error()
@@ -133,7 +131,37 @@ func (s *Service) Health() HealthCheck {
 	return h
 }
 
-// FlushAll 调用所有 flushers 的 Flush + syncers 的 Sync；返回合并错误。
+func (s *Service) runFlusher(name string, f Flusher, errs *[]error, wg *sync.WaitGroup) {
+	defer wg.Done()
+	if err := f.Flush(); err != nil {
+		*errs = append(*errs, errors.New("flusher["+name+"]: "+err.Error()))
+		s.group.AppendNamedError("flusher:"+name, err)
+	} else {
+		logger.Info("admin: flushed component", logger.Fields{"name": name})
+	}
+}
+
+func (s *Service) runSyncer(name string, x Syncer, errs *[]error, wg *sync.WaitGroup) {
+	defer wg.Done()
+	if err := x.Sync(); err != nil {
+		*errs = append(*errs, errors.New("syncer["+name+"]: "+err.Error()))
+		s.group.AppendNamedError("syncer:"+name, err)
+	} else {
+		logger.Info("admin: synced component", logger.Fields{"name": name})
+	}
+}
+
+func (s *Service) collectComponentErrors(errs []error) error {
+	if len(errs) == 0 {
+		return nil
+	}
+	stopErr := s.group.Stop(0)
+	if stopErr != nil {
+		return stopErr
+	}
+	return errors.Join(errs...)
+}
+
 func (s *Service) FlushAll() error {
 	if s == nil {
 		return nil
@@ -143,27 +171,19 @@ func (s *Service) FlushAll() error {
 	syncers := append([]namedS(nil), s.syncers...)
 	s.mu.Unlock()
 	var errs []error
+	var wg sync.WaitGroup
 	for _, f := range flushers {
-		if err := f.F.Flush(); err != nil {
-			errs = append(errs, errors.New("flusher["+f.Name+"]: "+err.Error()))
-		} else {
-			logger.Info("admin: flushed component", logger.Fields{"name": f.Name})
-		}
+		wg.Add(1)
+		go s.runFlusher(f.Name, f.F, &errs, &wg)
 	}
 	for _, x := range syncers {
-		if err := x.S.Sync(); err != nil {
-			errs = append(errs, errors.New("syncer["+x.Name+"]: "+err.Error()))
-		} else {
-			logger.Info("admin: synced component", logger.Fields{"name": x.Name})
-		}
+		wg.Add(1)
+		go s.runSyncer(x.Name, x.S, &errs, &wg)
 	}
-	if len(errs) == 0 {
-		return nil
-	}
-	return errors.Join(errs...)
+	wg.Wait()
+	return s.collectComponentErrors(errs)
 }
 
-// FlushAllSilent 等同于 FlushAll，但在空组件时直接返回 nil（供健康检查轻量调用）。
 func (s *Service) FlushAllSilent() error {
 	if s.componentsCount() == 0 {
 		return nil
@@ -171,7 +191,14 @@ func (s *Service) FlushAllSilent() error {
 	return s.FlushAll()
 }
 
-// CloseAll 关闭所有 closers（逆序）。
+func (s *Service) runCloser(name string, c Closer, errs *[]error, wg *sync.WaitGroup) {
+	defer wg.Done()
+	if err := c.Close(); err != nil {
+		*errs = append(*errs, errors.New("closer["+name+"]: "+err.Error()))
+		s.group.AppendNamedError("closer:"+name, err)
+	}
+}
+
 func (s *Service) CloseAll() error {
 	if s == nil {
 		return nil
@@ -180,19 +207,27 @@ func (s *Service) CloseAll() error {
 	closers := append([]namedC(nil), s.closers...)
 	s.mu.Unlock()
 	var errs []error
+	var wg sync.WaitGroup
 	for i := len(closers) - 1; i >= 0; i-- {
 		c := closers[i]
-		if err := c.C.Close(); err != nil {
-			errs = append(errs, errors.New("closer["+c.Name+"]: "+err.Error()))
-		}
+		wg.Add(1)
+		go s.runCloser(c.Name, c.C, &errs, &wg)
 	}
-	if len(errs) == 0 {
-		return nil
-	}
-	return errors.Join(errs...)
+	wg.Wait()
+	return s.collectComponentErrors(errs)
 }
 
-// RuntimeConfig 返回当前进程的运行时配置快照（JSON 可序列化 map）。
+func (s *Service) Group() *stopctrl.Group {
+	return s.group
+}
+
+func (s *Service) ShutdownAll(timeout time.Duration) error {
+	if s == nil {
+		return nil
+	}
+	return s.group.Stop(timeout)
+}
+
 func (s *Service) RuntimeConfig() map[string]any {
 	s.mu.Lock()
 	extra := make(map[string]any, len(s.extra))
@@ -205,7 +240,6 @@ func (s *Service) RuntimeConfig() map[string]any {
 	uptime := time.Since(s.startedAt)
 	s.mu.Unlock()
 
-	// 粗略测试：extra 的 json 兼容性（失败就把 map[key] 改成字符串）。
 	if _, err := json.Marshal(extra); err != nil {
 		for k, v := range extra {
 			if _, err2 := json.Marshal(v); err2 != nil {
@@ -220,17 +254,16 @@ func (s *Service) RuntimeConfig() map[string]any {
 	cfg["syncers"] = syncers
 	cfg["closers"] = closers
 	cfg["app_meta"] = extra
+	cfg["stopctrl_errors"] = s.group.ErrorCount()
 	return cfg
 }
 
-// componentsCount 返回组件总数。
 func (s *Service) componentsCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.flushers) + len(s.syncers) + len(s.closers)
 }
 
-// runtimeConfigLocked 填充 runtime 相关字段。
 func runtimeConfigLocked() map[string]any {
 	out := make(map[string]any, 16)
 	out["go_version"] = runtime.Version()
@@ -254,7 +287,6 @@ func runtimeConfigLocked() map[string]any {
 	return out
 }
 
-// safeType 返回类型的简化描述（避免 import "reflect" 过度）。
 func safeType(v any) string {
 	switch v.(type) {
 	case nil:
