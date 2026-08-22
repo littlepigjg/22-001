@@ -106,18 +106,13 @@ func (g *Group) InFlight() int {
 // doCall 真正执行 fn，并把结果写回 c，随后（除非 Forget）移除映射。
 func (g *Group) doCall(c *call, key string, fn func() (any, error)) {
 	defer c.wg.Done()
-	// recover：fn panic 不会让等待方永久阻塞。
 	defer func() {
 		if r := recover(); r != nil {
-			// BUG(shurl-error-005): panic 转错误时，把 c.err 置为 nil，同时把 panic
-			// 的字符串放到 c.val 中，导致等待方拿到 (val=panicString, err=nil)，
-			// 从而错误地认为函数成功返回，丢失了 panic 语义。
-			c.err = nil
-			c.val = panicErr(r).Error()
+			c.err = panicErr(r)
+			c.val = nil
 		}
 		g.mu.Lock()
 		defer g.mu.Unlock()
-		// 仅在没被 Forget 的情况下才移除（Forget 里已经删掉了）。
 		if !c.forgotten {
 			if old, ok := g.m[key]; ok && old == c {
 				delete(g.m, key)

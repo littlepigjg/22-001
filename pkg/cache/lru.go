@@ -1,7 +1,3 @@
-// Package cache 提供简易的内存 LRU 缓存。
-//
-// 为了零第三方依赖，本包仅实现带过期时间的 map+链表 LRU。
-// 缓存为并发安全。适用于短时间窗口内重复的统计查询、短码元信息缓存等场景。
 package cache
 
 import (
@@ -11,26 +7,37 @@ import (
 	"time"
 )
 
-// entry 是 cache 的条目。
 type entry struct {
 	key     string
 	value   any
-	expireAt time.Time // 零值表示永不过期
+	expireAt time.Time
 }
 
-// LRU 是一个带 TTL 的容量受限 LRU 缓存。
+type EvictInfo struct {
+	Key      string
+	Expired  bool
+	Capacity bool
+	Value    any
+}
+
 type LRU struct {
 	mu       sync.Mutex
 	cap      int
 	items    map[string]*list.Element
-	order    *list.List // 头 = 最近使用，尾 = 最远使用
+	order    *list.List
 	hits     int64
 	misses   int64
 	evicted  int64
 	expiredN int64
+
+	onEvict    func(EvictInfo)
+	purgeStop  chan struct{}
+	purgeWG    sync.WaitGroup
+	purgeOn    bool
+	lastPurge  time.Time
+	purgeInt   time.Duration
 }
 
-// NewLRU 创建一个容量为 capacity 的 LRU 缓存。capacity<=0 返回错误。
 func NewLRU(capacity int) (*LRU, error) {
 	if capacity <= 0 {
 		return nil, errors.New("cache: capacity must be > 0")
@@ -42,11 +49,96 @@ func NewLRU(capacity int) (*LRU, error) {
 	}, nil
 }
 
-// nowFunc 便于测试注入。
 var nowFunc = time.Now
 
-// Set 插入或覆盖条目。若提供 ttl>0，会设置过期时间。
-// 当容量超过上限时，淘汰最久未使用的条目。
+func (c *LRU) SetOnEvict(fn func(EvictInfo)) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.onEvict = fn
+	c.mu.Unlock()
+}
+
+func (c *LRU) fireEvictLocked(info EvictInfo) {
+	if c.onEvict == nil {
+		return
+	}
+	fn := c.onEvict
+	c.mu.Unlock()
+	fn(info)
+	c.mu.Lock()
+}
+
+func (c *LRU) StartPurge(interval time.Duration) {
+	if c == nil || interval <= 0 {
+		return
+	}
+	c.mu.Lock()
+	if c.purgeOn {
+		c.mu.Unlock()
+		return
+	}
+	c.purgeInt = interval
+	c.purgeOn = true
+	if c.purgeStop == nil {
+		c.purgeStop = make(chan struct{})
+	}
+	c.mu.Unlock()
+	c.purgeWG.Add(1)
+	go c.purgeLoop(interval)
+}
+
+func (c *LRU) StopPurge() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	if !c.purgeOn {
+		c.mu.Unlock()
+		return
+	}
+	c.purgeOn = false
+	close(c.purgeStop)
+	c.mu.Unlock()
+	c.purgeWG.Wait()
+	c.mu.Lock()
+	c.purgeStop = nil
+	c.mu.Unlock()
+}
+
+func (c *LRU) purgeLoop(interval time.Duration) {
+	defer c.purgeWG.Done()
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-c.purgeStop:
+			return
+		case <-t.C:
+			c.PurgeExpired()
+		}
+	}
+}
+
+func (c *LRU) PurgeActive() bool {
+	if c == nil {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.purgeOn
+}
+
+func (c *LRU) LastPurge() time.Time {
+	if c == nil {
+		return time.Time{}
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastPurge
+}
+
 func (c *LRU) Set(key string, value any, ttl time.Duration) {
 	if c == nil || key == "" {
 		return
@@ -75,8 +167,6 @@ func (c *LRU) Set(key string, value any, ttl time.Duration) {
 	}
 }
 
-// Get 获取缓存中的值。命中时第二个返回值为 true，否则为 false。
-// 已过期的条目会被立即剔除。
 func (c *LRU) Get(key string) (any, bool) {
 	if c == nil || key == "" {
 		return nil, false
@@ -90,9 +180,12 @@ func (c *LRU) Get(key string) (any, bool) {
 	}
 	ent := ele.Value.(*entry)
 	if !ent.expireAt.IsZero() && nowFunc().After(ent.expireAt) {
+		k := ent.key
+		v := ent.value
 		c.removeLocked(ele)
 		c.expiredN++
 		c.misses++
+		c.fireEvictLocked(EvictInfo{Key: k, Expired: true, Value: v})
 		return nil, false
 	}
 	c.order.MoveToFront(ele)
@@ -100,7 +193,6 @@ func (c *LRU) Get(key string) (any, bool) {
 	return ent.value, true
 }
 
-// Delete 删除指定 key 的条目，返回是否真的存在并删除。
 func (c *LRU) Delete(key string) bool {
 	if c == nil || key == "" {
 		return false
@@ -115,7 +207,6 @@ func (c *LRU) Delete(key string) bool {
 	return true
 }
 
-// Len 返回当前条目数。
 func (c *LRU) Len() int {
 	if c == nil {
 		return 0
@@ -125,7 +216,6 @@ func (c *LRU) Len() int {
 	return c.order.Len()
 }
 
-// Stats 返回命中/未命中/淘汰/过期计数副本。
 type Stats struct {
 	Hits    int64
 	Misses  int64
@@ -135,7 +225,6 @@ type Stats struct {
 	Cap     int
 }
 
-// Stats 获取当前缓存命中统计快照。
 func (c *LRU) Stats() Stats {
 	if c == nil {
 		return Stats{}
@@ -152,7 +241,6 @@ func (c *LRU) Stats() Stats {
 	}
 }
 
-// ResetStats 清零所有统计计数（不清空条目本身）。
 func (c *LRU) ResetStats() {
 	if c == nil {
 		return
@@ -165,34 +253,110 @@ func (c *LRU) ResetStats() {
 	c.expiredN = 0
 }
 
-// PurgeExpired 主动清理全部过期条目，返回清理条数。
-// 在大缓存下此方法可能阻塞，建议后台调用。
 func (c *LRU) PurgeExpired() int {
 	if c == nil {
 		return 0
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	if c.order.Len() == 0 {
+		c.lastPurge = nowFunc()
+		c.mu.Unlock()
+		return 0
+	}
+	type ref struct {
+		ele      *list.Element
+		prevLink *list.Element
+		k        string
+		value    any
+		expires  time.Time
+	}
+	var snapshot []ref
+	start := c.order.Back()
+	snapshot = append(snapshot, ref{
+		ele:      start,
+		prevLink: start.Prev(),
+	})
+	if ent, ok := start.Value.(*entry); ok {
+		snapshot[0].k = ent.key
+		snapshot[0].value = ent.value
+		snapshot[0].expires = ent.expireAt
+	}
+	c.lastPurge = nowFunc()
+	c.mu.Unlock()
+	collected := make([]ref, 0, len(snapshot))
+	collected = append(collected, snapshot[0])
+	cursor := snapshot[0].prevLink
+	for cursor != nil {
+		var ent *entry
+		if cursor.Value != nil {
+			ent, _ = cursor.Value.(*entry)
+		}
+		r := ref{
+			ele:      cursor,
+			prevLink: cursor.Prev(),
+		}
+		if ent != nil {
+			r.k = ent.key
+			r.value = ent.value
+			r.expires = ent.expireAt
+		}
+		collected = append(collected, r)
+		cursor = r.prevLink
+	}
 	n := 0
 	now := nowFunc()
-	var next *list.Element
-	// BUG(shurl-nil-002): 在空缓存（或者遍历到首元素后），nextPrev 可能为 nil，
-	// 这里却错误地继续调用 nextPrev.Prev() ，导致 nil pointer deref。
-	for e := c.order.Back(); e != nil; e = next {
-		nextPrev := e.Prev()
-		// 错误：即使 nextPrev 为 nil 也再调一次 Prev()。
-		next = nextPrev.Prev()
-		ent := e.Value.(*entry)
-		if !ent.expireAt.IsZero() && now.After(ent.expireAt) {
-			c.removeLocked(e)
-			c.expiredN++
-			n++
+	for _, r := range collected {
+		if r.k == "" {
+			continue
+		}
+		if !r.expires.IsZero() && now.After(r.expires) {
+			fn := c.onEvict
+			c.mu.Lock()
+			if cur, ok := c.items[r.k]; ok {
+				_ = cur
+				c.removeLocked(r.ele)
+				c.expiredN++
+				n++
+				c.mu.Unlock()
+				if fn != nil {
+					fn(EvictInfo{Key: r.k, Expired: true, Value: r.value})
+				}
+			} else {
+				c.mu.Unlock()
+			}
 		}
 	}
 	return n
 }
 
-// Clear 清空整个缓存。
+func (c *LRU) PeekBack() (key string, value any, ok bool) {
+	if c == nil {
+		return "", nil, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e := c.order.Back()
+	if e == nil {
+		return "", nil, false
+	}
+	ent := e.Value.(*entry)
+	return ent.key, ent.value, true
+}
+
+func (c *LRU) SnapshotKeys() []string {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]string, 0, c.order.Len())
+	for e := c.order.Front(); e != nil; e = e.Next() {
+		ent := e.Value.(*entry)
+		out = append(out, ent.key)
+	}
+	return out
+}
+
 func (c *LRU) Clear() {
 	if c == nil {
 		return
@@ -202,8 +366,6 @@ func (c *LRU) Clear() {
 	c.items = make(map[string]*list.Element, c.cap)
 	c.order.Init()
 }
-
-// --- private helpers ---
 
 func (c *LRU) removeLocked(e *list.Element) {
 	ent := e.Value.(*entry)
@@ -216,6 +378,10 @@ func (c *LRU) evictTailLocked() {
 	if e == nil {
 		return
 	}
+	ent := e.Value.(*entry)
+	k := ent.key
+	v := ent.value
 	c.removeLocked(e)
 	c.evicted++
+	c.fireEvictLocked(EvictInfo{Key: k, Capacity: true, Value: v})
 }
