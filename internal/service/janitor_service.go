@@ -119,11 +119,11 @@ func (j *JanitorService) RunOnce(batch int) int {
 // runOnce 执行一次巡检，返回被标记的条目数。
 func (j *JanitorService) runOnce(batch int) int {
 	now := time.Now()
-	var processed, marked int
-	candidates := make([]*model.ShortURL, 0, batch)
+	var marked int
+	candidates := make([]string, 0, batch)
 
 	err := j.urlStore.ForEach(func(u *model.ShortURL) bool {
-		if processed >= batch {
+		if len(candidates) >= batch {
 			return false
 		}
 		if u == nil {
@@ -133,10 +133,9 @@ func (j *JanitorService) runOnce(batch int) int {
 			return true
 		}
 		if u.IsExpired(now) || u.ExceedsMaxVisits() {
-			candidates = append(candidates, u)
+			candidates = append(candidates, u.Code)
 			marked++
 		}
-		processed++
 		return true
 	})
 	if err != nil {
@@ -144,18 +143,20 @@ func (j *JanitorService) runOnce(batch int) int {
 		return 0
 	}
 
-	// 批量更新 Disabled 字段。
+	// 在写锁下逐条置为禁用。
 	updated := 0
-	for _, u := range candidates {
-		u.Disabled = true
-		if err := j.urlStore.Save(u, true); err != nil {
-			logger.Warn("janitor disable url error", logger.Fields{"err": err.Error(), "code": u.Code})
+	for _, code := range candidates {
+		_, err := j.urlStore.Update(code, func(u *model.ShortURL) {
+			u.Disabled = true
+		})
+		if err != nil {
+			logger.Warn("janitor disable url error", logger.Fields{"err": err.Error(), "code": code})
 			continue
 		}
 		updated++
 	}
 	if updated > 0 {
-		logger.Info("janitor sweep completed", logger.Fields{"processed": processed, "marked": marked, "updated": updated})
+		logger.Info("janitor sweep completed", logger.Fields{"marked": marked, "updated": updated})
 	}
 	return updated
 }

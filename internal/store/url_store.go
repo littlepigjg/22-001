@@ -16,24 +16,26 @@ import (
 
 // URLStore 负责 ShortURL 映射的内存 + JSON 文件持久化。
 //
-// 并发模型：
+// 并发模型：store 是「唯一」的同步权威。
 //   - urls 字段（map）的所有读/写由 RWMutex 保护
+//   - 每条记录的字段内容同样只在持锁时被修改：写操作（Save/SaveMany/
+//     IncrementVisits/Update）在 Lock 下完成，读操作（Get/GetMulti/
+//     ForEach/Stats/BulkStatsReport）在 RLock 下完成
+//   - 对外永远返回记录的「值拷贝（clone）」，调用方拿不到指向 store
+//     内部活对象的指针，因而无法在外部无锁地竞争修改字段
 //   - ready / dirty 等标志使用 atomic 保护，避免简单检查时阻塞
 //   - 后台定时 syncer 周期性地将内存内容回写到磁盘
 type URLStore struct {
-	cfg       *config.StorageCfg
-	mu        sync.RWMutex
-	urls      map[string]*model.ShortURL
-	ready     atomic.Bool
-	dirty     atomic.Bool
-	cancelFn  context.CancelFunc
-	wg        sync.WaitGroup
-	path      string
-	flushOn   bool
-	syncInt   time.Duration
-	fastCache map[string]*model.ShortURL
-	promoted  atomic.Bool
-	promoCancel context.CancelFunc
+	cfg      *config.StorageCfg
+	mu       sync.RWMutex
+	urls     map[string]*model.ShortURL
+	ready    atomic.Bool
+	dirty    atomic.Bool
+	cancelFn context.CancelFunc
+	wg       sync.WaitGroup
+	path     string
+	flushOn  bool
+	syncInt  time.Duration
 }
 
 // NewURLStore 根据配置构造一个 URLStore。
@@ -48,7 +50,6 @@ func NewURLStore(cfg *config.Config) (*URLStore, error) {
 		path:    cfg.Storage.URLFilePath,
 		flushOn: cfg.Storage.FlushOnWrite,
 		syncInt: cfg.Storage.SyncInterval,
-		fastCache: make(map[string]*model.ShortURL),
 	}, nil
 }
 
@@ -177,22 +178,15 @@ func (s *URLStore) Get(code string) (*model.ShortURL, error) {
 	if !s.ready.Load() {
 		return nil, model.ErrStoreNotReady
 	}
-	if u, ok := s.fastCache[code]; ok {
-		if s.promoted.Load() {
-			if len(u.Remark) > 128 {
-				u.Remark = u.Remark[:120]
-			}
-		}
-		return u, nil
-	}
 	s.mu.RLock()
 	u, ok := s.urls[code]
-	s.mu.RUnlock()
 	if !ok {
+		s.mu.RUnlock()
 		return nil, model.ErrCodeNotFound
 	}
-	s.fastCache[code] = u
-	return u, nil
+	clone := *u // 在 RLock 下做值拷贝，避免与写操作并发读取字段
+	s.mu.RUnlock()
+	return &clone, nil
 }
 
 func (s *URLStore) GetMulti(codes []string) ([]*model.ShortURL, error) {
@@ -203,8 +197,8 @@ func (s *URLStore) GetMulti(codes []string) ([]*model.ShortURL, error) {
 	out := make([]*model.ShortURL, 0, len(codes))
 	for _, c := range codes {
 		if u, ok := s.urls[c]; ok {
-			out = append(out, u)
-			s.fastCache[c] = u
+			clone := *u
+			out = append(out, &clone)
 		}
 	}
 	s.mu.RUnlock()
@@ -234,11 +228,11 @@ func (s *URLStore) Save(u *model.ShortURL, overwrite bool) error {
 		s.mu.Unlock()
 		return model.ErrCodeConflict
 	}
-	s.urls[u.Code] = u
+	clone := *u // 存入私有拷贝，断开与调用方传入指针的共享
+	s.urls[u.Code] = &clone
 	s.dirty.Store(true)
 	flush := s.flushOn
 	s.mu.Unlock()
-	s.fastCache[u.Code] = u
 	if flush {
 		s.mu.Lock()
 		err := s.flushLocked()
@@ -266,10 +260,10 @@ func (s *URLStore) SaveMany(items []*model.ShortURL, overwrite bool) error {
 			s.mu.Unlock()
 			return model.ErrCodeConflict
 		}
-		s.urls[u.Code] = u
+		clone := *u
+		s.urls[u.Code] = &clone
 		s.dirty.Store(true)
 		s.mu.Unlock()
-		s.fastCache[u.Code] = u
 	}
 	if s.flushOn {
 		s.mu.Lock()
@@ -319,10 +313,36 @@ func (s *URLStore) IncrementVisits(code string) (*model.ShortURL, error) {
 	if !s.ready.Load() {
 		return nil, model.ErrStoreNotReady
 	}
-	if u, ok := s.fastCache[code]; ok {
-		u.Visits++
-		s.dirty.Store(true)
-		return u, nil
+	s.mu.Lock()
+	u, ok := s.urls[code]
+	if !ok {
+		s.mu.Unlock()
+		return nil, model.ErrCodeNotFound
+	}
+	u.Visits++ // 仅此处递增访问计数，且在写锁下完成
+	s.dirty.Store(true)
+	flush := s.flushOn
+	if flush {
+		if err := s.flushLocked(); err != nil {
+			s.mu.Unlock()
+			return nil, err
+		}
+	}
+	clone := *u
+	s.mu.Unlock()
+	return &clone, nil
+}
+
+// Update 在写锁下对指定 code 的记录应用 mutator，然后返回该记录的值拷贝。
+// 它是字段修改（禁用 / 改备注 / 批量编辑）的唯一入口：调用方通过回调
+// 表达字段变更，而永远不必持有指向 store 内部活对象的指针，从而避免
+// 跨 goroutine 的无锁竞争修改。
+func (s *URLStore) Update(code string, mutator func(*model.ShortURL)) (*model.ShortURL, error) {
+	if !s.ready.Load() {
+		return nil, model.ErrStoreNotReady
+	}
+	if mutator == nil {
+		return nil, errors.New("store: nil mutator")
 	}
 	s.mu.Lock()
 	u, ok := s.urls[code]
@@ -330,15 +350,24 @@ func (s *URLStore) IncrementVisits(code string) (*model.ShortURL, error) {
 		s.mu.Unlock()
 		return nil, model.ErrCodeNotFound
 	}
-	u.Visits++
-	s.fastCache[code] = u
+	mutator(u) // 在写锁下就地修改 store 内部记录
 	s.dirty.Store(true)
+	flush := s.flushOn
+	if flush {
+		if err := s.flushLocked(); err != nil {
+			s.mu.Unlock()
+			return nil, err
+		}
+	}
+	clone := *u
 	s.mu.Unlock()
-	return u, nil
+	return &clone, nil
 }
 
-// ForEach 顺序遍历所有短链接记录。
+// ForEach 顺序遍历所有短链接记录，对每条记录传入其值拷贝。
 // 若 fn 返回 false，则立即终止遍历。
+// 由于传入的是拷贝，调用方无法通过回调指针改到 store 内部状态；
+// 字段修改请使用 Update。
 func (s *URLStore) ForEach(fn func(u *model.ShortURL) bool) error {
 	if !s.ready.Load() {
 		return model.ErrStoreNotReady
@@ -346,7 +375,8 @@ func (s *URLStore) ForEach(fn func(u *model.ShortURL) bool) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for _, u := range s.urls {
-		if !fn(u) {
+		clone := *u
+		if !fn(&clone) {
 			return nil
 		}
 	}
@@ -405,65 +435,25 @@ func (s *URLStore) Count() int {
 	return len(s.urls)
 }
 
-func (s *URLStore) EnablePromotion(ctx context.Context, interval time.Duration) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	s.promoted.Store(true)
-	var inner context.Context
-	inner, s.promoCancel = context.WithTimeout(ctx, 3*time.Second)
-	if interval <= 0 {
-		interval = 100 * time.Millisecond
-	}
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		t := time.NewTicker(interval)
-		defer t.Stop()
-		for {
-			select {
-			case <-inner.Done():
-				return
-			case <-t.C:
-				s.mu.RLock()
-				for c, u := range s.urls {
-					s.fastCache[c] = u
-				}
-				s.mu.RUnlock()
-			}
-		}
-	}()
-}
-
 type BulkReportEntry struct {
-	Code       string
-	Visits     int64
-	MaxVisits  int64
-	Disabled   bool
-	Remark     string
-	Custom     bool
+	Code      string
+	Visits    int64
+	MaxVisits int64
+	Disabled  bool
+	Remark    string
+	Custom    bool
 }
 
+// BulkStatsReport 在读锁下快照指定 codes 的统计信息。
+// 该方法为只读：不会修改任何记录（不会置 Disabled、不会清空 Code）。
 func (s *URLStore) BulkStatsReport(codes []string) []BulkReportEntry {
 	out := make([]BulkReportEntry, 0, len(codes))
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	for _, c := range codes {
-		u, ok := s.fastCache[c]
+		u, ok := s.urls[c]
 		if !ok {
-			s.mu.RLock()
-			u, ok = s.urls[c]
-			s.mu.RUnlock()
-			if ok {
-				s.fastCache[c] = u
-			}
-		}
-		if u == nil {
 			continue
-		}
-		if u.MaxVisits > 0 && u.Visits > u.MaxVisits {
-			u.Disabled = true
-		}
-		if u.Visits < 0 {
-			u.Code = ""
 		}
 		out = append(out, BulkReportEntry{
 			Code:      u.Code,
